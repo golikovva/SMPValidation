@@ -1,0 +1,15 @@
+data:
+  start_date: '2019-01-01'
+  end_date: '2023-08-09'
+  wrf_folder: '/home/wrf_data/'
+  era_folder: '/home/era_data/'
+  glorys_folder: '/home/glorys_data/'
+  nemo_folder: '/home/nemo_data/'
+  scatter_folder: '/home/scatter/'
+  stations_folder: '/home/stations/clear'
+  wrf_mean_path: "/home/metadata/means_dict"
+  wrf_std_path: "/home/metadata/stds_dict"
+  base_folder: '/home'
+  logs_folder: "/home/logs/"
+  wrf_variables: ['uvmet10', 'T2', 'SEAICE']
+  era_variables: ['u10', 'v10', 't2m']

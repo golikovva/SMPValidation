@@ -1,0 +1,10 @@
+.vscode/sftp.json
+libs/config/__pycache__/cfg.cpython-310.pyc
+libs/config/__pycache__/cfg.cpython-312.pyc
+libs/config/__pycache__/config.cpython-310.pyc
+libs/config/__pycache__/config.cpython-312.pyc
+libs/config/__pycache__/create_config.cpython-310.pyc
+libs/config/__pycache__/create_config.cpython-312.pyc
+libs/config/__pycache__/net_params.cpython-310.pyc
+libs/validation/__pycache__/__init__.cpython-312.pyc
+libs/validation/__pycache__/grid.cpython-312.pyc
