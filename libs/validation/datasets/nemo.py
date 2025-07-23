@@ -203,6 +203,30 @@ class NemoTemperatureDataset(ModelTemperatureDataset, NemoDataset):
         """
         return 'votemper'
 
+class NemoSurfaceTemperatureDataset(ModelTemperatureDataset, NemoDataset):
+    """
+    Dataset class for handling NEMO temperature data.
+    """
+
+    @property
+    def _files_template(self):
+        """
+        Returns the file template for locating NEMO temperature data files.
+
+        Returns:
+            str: The file path template for temperature data.
+        """
+        return 'run_*/NESTP12-VP1_*_forecast.*_gridT*.nc'
+
+    @property
+    def _temp_variable(self):
+        """
+        Specifies the temperature variable.
+
+        Returns:
+            str: The variable name for temperature data.
+        """
+        return 'sosstsst'
 
 class NemoEastCurrentDataset(ModelEastCurrentDataset, NemoDataset):
     """
