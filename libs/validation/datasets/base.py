@@ -465,6 +465,13 @@ class ModelTemperatureDataset(Dataset):
         raise NotImplementedError
 
 
+class ModelSurfaceTemperatureDataset(ModelTemperatureDataset):
+    def _extract_data(self, file, load_fn=xr.open_dataset):
+        data = super()._extract_data(file, load_fn)
+        data = data[:, None, :, :]
+        return data
+    
+    
 class ModelEastCurrentDataset(Dataset):
     """
     Dataset class for handling eastward current data.

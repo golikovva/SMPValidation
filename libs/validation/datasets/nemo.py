@@ -12,6 +12,7 @@ from libs.validation.datasets.base import (
     ModelSurfaceSalinityDataset,
     ModelSicDataset,
     ModelTemperatureDataset,
+    ModelSurfaceTemperatureDataset,
     ModelThickDataset,
 )
 
@@ -203,7 +204,7 @@ class NemoTemperatureDataset(ModelTemperatureDataset, NemoDataset):
         """
         return 'votemper'
 
-class NemoSurfaceTemperatureDataset(ModelTemperatureDataset, NemoDataset):
+class NemoSurfaceTemperatureDataset(ModelSurfaceTemperatureDataset, NemoDataset):
     """
     Dataset class for handling NEMO temperature data.
     """

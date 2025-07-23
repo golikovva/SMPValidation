@@ -210,3 +210,82 @@ def label_seas_on_grid(lats: np.ndarray,
 def make_sea_mask_from_shapefile(lats, lons, shapefile_path):
     gdf = gpd.read_file(shapefile_path)
     return label_seas_on_grid(lats, lons, gdf)
+
+def dataset_with_indices(cls):
+    """
+    Modifies the given Dataset class to return a tuple data, target, index
+    instead of just data, target.
+
+    e.g. MNISTWithIndices = dataset_with_indices(MNIST)
+         dataset = MNISTWithIndices('~/datasets/mnist')
+    """
+
+    def __getitem__(self, index):
+        data = cls.__getitem__(self, index)
+        return *data, index
+
+    return type(cls.__name__, (cls,), {
+        '__getitem__': __getitem__,
+    })
+
+
+def surface_dataset(cls):
+    """
+    Modifies the given Dataset class to return a tuple data, target, index
+    instead of just data, target.
+
+    e.g. MNISTWithIndices = dataset_with_indices(MNIST)
+         dataset = MNISTWithIndices('~/datasets/mnist')
+    """
+
+    def __getitem__(self, index):
+        data = cls.__getitem__(self, index)[[0,]]
+        return data
+
+    return type(cls.__name__, (cls,), {
+        '__getitem__': __getitem__,
+    })
+
+class SurfaceDataset:
+    """
+    A transparent wrapper around any object implementing the Dataset protocol.
+    When accessed with a date key, it returns data for surface layer.
+
+    All other attributes/methods (grid, dates_dict, name, __len__, etc.)
+    are delegated to the underlying dataset.
+    """
+
+    def __init__(self, base_ds: Dataset):
+        """
+        Parameters
+        ----------
+        base_ds : Dataset
+            The original dataset instance to wrap.
+        """
+
+        self._base_ds: Dataset = base_ds
+        # Helpful suffix for reports/validators so delayed datasets are distinguishable
+        suffix = f"surface"
+        self.name: str = f"{getattr(base_ds, 'name', base_ds.__class__.__name__)}_{suffix}"
+
+    def __getattr__(self, item: str):
+        """
+        Delegate all attribute access (except the ones we redefine)
+        to the underlying dataset.
+        """
+        return getattr(self._base_ds, item)
+
+    def __getitem__(self, date):
+        """
+        Return data for (date - self._delay).  If the underlying dataset
+        returns None, we propagate that None unchanged.
+        """
+        return self._base_ds[date][[0]]
+
+    def __len__(self) -> int:
+        """Delegate len(...) to the base dataset."""
+        return len(self._base_ds)
+    
+def surfaced(dataset: Dataset) -> DelayedDataset:
+    """Utility function for concise wrapping."""
+    return SurfaceDataset(dataset)
