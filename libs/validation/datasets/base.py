@@ -41,11 +41,6 @@ class Dataset(ABC):
         self.average_times = average_times
         self.name = name
 
-        # Ensure average_times is specified when dst_grid is provided
-        if self.dst_grid is not None and self.average_times is None:
-            raise ValueError('average_times must be specified when dst_grid is '
-                             '(4d interpolation is not currently supported)')
-
         # Optional: Print dataset initialization message
         if self.name is not None:
             print(f'initializing {self.name} dataset')
@@ -107,7 +102,6 @@ class Dataset(ABC):
         files = self.dates_dict[date]  # Get files for the specified date
         for file in sorted(files):
             data = self._extract_data(file)  # Extract data from file
-            assert len(data.shape) == 4, f'expected 4D data, got {data.shape}'  # Ensure 4D data
             result.append(data)
 
         result = np.concatenate(result, axis=0)  # Concatenate along the time dimension
@@ -119,7 +113,11 @@ class Dataset(ABC):
 
         # Apply interpolation if an interpolator is available
         if self.interpolator is not None:
-            result = np.stack([self.interpolator(field) for field in result])
+            res = []
+            for field in result.reshape(-1, *result.shape[-2:]):
+                interp_field = self.interpolator(field)
+                res.append(interp_field)
+            result = np.stack(res).reshape(*result.shape[:-2], *interp_field.shape[-2:])
 
         return result
 
@@ -617,3 +615,62 @@ class ModelCurrentVelocityDataset(Dataset):
         Must be implemented by subclasses.
         """
         raise NotImplementedError
+
+class ModelCurrentDataset(Dataset):
+    """
+    Dataset class for handling combined current velocity (eastward and northward components).
+    """
+
+    def _process_field(self, field):
+        """
+        Processes the current velocity field without additional transformations.
+
+        Args:
+            field (np.array): Raw current velocity data.
+
+        Returns:
+            np.array: Processed current velocity data.
+        """
+        return field  # No processing required for current velocity
+
+    def _extract_data(self, file, load_fn=xr.open_dataset):
+        """
+        Extracts current velocity data (eastward and northward components) from the given file.
+
+        Args:
+            file (str): Path to the data file.
+            load_fn (callable, optional): Function to load the file.
+
+        Returns:
+            np.array: Extracted and combined current velocity data.
+        """
+        ds = load_fn(file)
+        ufield = ds.variables[self._east_cur_variable].values  # Get eastward component
+        vfield = ds.variables[self._north_cur_variable].values  # Get northward component
+        data = np.stack([
+            self._process_field(ufield),
+            self._process_field(vfield),
+        ], axis=1)  # Stack u and v components along a new axis
+        return data
+
+    @property
+    @abstractmethod
+    def _east_cur_variable(self):
+        """
+        Abstract property to specify the eastward current variable name.
+
+        Must be implemented by subclasses.
+        """
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def _north_cur_variable(self):
+        """
+        Abstract property to specify the northward current variable name.
+
+        Must be implemented by subclasses.
+        """
+        raise NotImplementedError
+
+
