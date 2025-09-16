@@ -52,7 +52,22 @@ class Grid:
         return self.grid.get_coords(1, staggerloc=esmpy.StaggerLoc.CENTER)[:]
 
     @property
+    def latitude(self):
+        """
+        Returns the latitude values at the center of the grid cells.
+        """
+        return self.grid.get_coords(1, staggerloc=esmpy.StaggerLoc.CENTER)[:]
+
+
+    @property
     def lon(self):
+        """
+        Returns the longitude values at the center of the grid cells.
+        """
+        return self.grid.get_coords(0, staggerloc=esmpy.StaggerLoc.CENTER)[:]
+
+    @property
+    def longitude(self):
         """
         Returns the longitude values at the center of the grid cells.
         """
