@@ -269,8 +269,6 @@ class SeasonalSpatialAggregator(Aggregator):
         return result
     
 
-    
-
 class CoordinateTemporalAggregator(Aggregator):
     """
     Для каждого набора координат из coords_dict строит интерполяционное дерево,
