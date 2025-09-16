@@ -100,7 +100,7 @@ class PartialConv2dFixed(nn.Conv2d):
         else:
             self.return_mask = False
 
-        super(PartialConv2d, self).__init__(*args, **kwargs)
+        super(PartialConv2dFixed, self).__init__(*args, **kwargs)
 
         if self.multi_channel:
             self.weight_maskUpdater = torch.ones(self.out_channels, self.in_channels, self.kernel_size[0], self.kernel_size[1])
@@ -133,19 +133,14 @@ class PartialConv2dFixed(nn.Conv2d):
                         
                 # self.update_mask = F.conv2d(mask, self.weight_maskUpdater, bias=None, stride=self.stride, padding=self.padding, dilation=self.dilation, groups=1)
                 self.update_mask = F.conv2d(mask, self.weight, bias=None, stride=self.stride, padding=self.padding, dilation=self.dilation, groups=1)
-                print('update mask',self.update_mask)
-                # for mixed precision training, change 1e-8 to 1e-6
-                print(self.slide_winsize, self.weight.sum())
-                # self.mask_ratio = self.slide_winsize/(self.update_mask + 1e-8)
 
                 self.mask_ratio = self.weight.sum()/(self.update_mask + 1e-8)
-                print('mask ratio', self.mask_ratio)
                 # self.mask_ratio = torch.max(self.update_mask)/(self.update_mask + 1e-8)
                 self.update_mask = torch.clamp(self.update_mask, 0, 1)
                 # self.mask_ratio = torch.mul(self.mask_ratio, self.update_mask)
 
 
-        raw_out = super(PartialConv2d, self).forward(torch.mul(input, mask) if mask_in is not None else input)
+        raw_out = super(PartialConv2dFixed, self).forward(torch.mul(input, mask) if mask_in is not None else input)
 
         if self.bias is not None:
             bias_view = self.bias.view(1, self.out_channels, 1, 1)
@@ -184,7 +179,7 @@ class GaussianPartialConv2d(nn.Module):
         kernel_2d = kernel_2d.repeat(channels, 1, 1, 1)  # (channels, 1, win_size, win_size)
         
         # Configure partial convolution
-        self.conv = PartialConv2d(
+        self.conv = PartialConv2dFixed(
             channels, channels, win_size, 
             padding=self.padding, bias=False, 
             groups=channels, multi_channel=multi_channel,
