@@ -2,6 +2,9 @@ import numpy as np
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Tuple, Sequence
 import warnings
+import torch
+from libs.validation.inv_dist_interp import InvDistTree
+
 
 class Aggregator(ABC):
     """
@@ -265,6 +268,101 @@ class SeasonalSpatialAggregator(Aggregator):
             result[season] = m
         return result
     
+
+    
+
+class CoordinateTemporalAggregator(Aggregator):
+    """
+    Для каждого набора координат из coords_dict строит интерполяционное дерево,
+    а затем накапливает среднее по этим точкам для каждого канала.
+    
+    Parameters
+    ----------
+    grid : object
+        Объект с атрибутами `.lat` и `.lon` — двумерными массивами формы (H, W).
+    coords_dict : Dict[str, np.ndarray]
+        Словарь "имя набора" → массив точек shape (N_points, 2) в тех же единицах,
+        что и grid.lat/lon (например, градусы).
+    leaf_size, n_near, sigma_squared, distance_metric, inv_dist_mode, device
+        Параметры проксейдерева для InvDistTree (см. класс InvDistTree).
+    """
+
+    def __init__(self,
+                 grid: Any,
+                 coords_dict: Dict[str, np.ndarray],
+                 leaf_size: int = 10,
+                 n_near: int = 6,
+                 sigma_squared: float = None,
+                 distance_metric: str = 'euclidean',
+                 inv_dist_mode: str = 'gaussian',
+                 device: str = 'cpu'):
+        # Сохраним словарь имен
+        self.names = list(coords_dict.keys())
+        # Подготовим массив исходных точек X: (H*W, 2)
+        lat = grid.lat    # shape (H, W)
+        lon = grid.lon    # shape (H, W)
+        H, W = lat.shape
+        X = np.stack([lat.ravel(), lon.ravel()], axis=1)  # (H*W, 2)
+
+        # Для каждого набора целевых точек Q строим InvDistTree
+        self.trees: Dict[str, InvDistTree] = {}
+        for name, Q in coords_dict.items():
+            # Q: np.ndarray shape (N_points, 2)
+            tree = InvDistTree(
+                x=X,
+                q=Q,
+                leaf_size=leaf_size,
+                n_near=n_near,
+                sigma_squared=sigma_squared,
+                distance_metric=distance_metric,
+                inv_dist_mode=inv_dist_mode,
+                device=device,
+                has_nans=True,
+            )
+            self.trees[name] = tree
+
+    def init_accumulator(self, shape: Tuple[int, ...]) -> Dict[str, Dict[Any, np.ndarray]]:
+        """
+        Игнорируем `shape`, возвращаем словарь:
+          name -> {}  
+        где под каждым именем накапливаем date -> np.ndarray(C,)
+        """
+        return {name: {} for name in self.names}
+
+    def accumulate(self,
+                   acc: Dict[str, Dict[Any, np.ndarray]],
+                   field: np.ndarray,
+                   date: Any) -> None:
+        """
+        Для каждого набора точек:
+          1) интерполируем field (C×H×W) на tree
+          2) усредняем по последней размерности (точки)
+          3) сохраняем в acc[name][date] = вектор length C
+        """
+        # Проверяем форму: должно быть как минимум 3D: (..., C,H,W), но мы ожидаем ровно C×H×W
+        arr = np.asarray(field)
+        if arr.ndim != 3:
+            raise ValueError(f"Field must be 3-dim (C,H,W), got {arr.shape}")
+        C, H, W = arr.shape
+
+        for name, tree in self.trees.items():
+            # Переводим в torch.Tensor на тот же device, что и веса дерева
+            # dtype=float32
+            z = torch.as_tensor(arr, dtype=tree.weights.dtype, device=tree.weights.device)
+            print(z.shape)
+            # Интерполируем: результат shape (C, N_points)
+            vals = tree(z.flatten(-2, -1))
+            print(vals.shape)
+            # Усредняем по точкам → shape (C,)
+            mean_vec = vals.cpu().numpy()
+            # Сохраняем
+            acc[name][date] = mean_vec
+
+    @staticmethod
+    def finalize(acc: Dict[str, Dict[Any, np.ndarray]]) -> Dict[str, Dict[Any, np.ndarray]]:
+        # Просто возвращаем накопленную структуру
+        return acc
+
 
 class RawFieldAggregator(Aggregator):
     """
