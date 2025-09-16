@@ -59,7 +59,7 @@ class Amsr2Dataset(Dataset):
         ds = load_fn(file)  # Load the dataset
         entry = ds.variables[self._amsr_variable]  # Extract geophysical data
         data = self._process_field(entry.values)  # Process the raw data
-        data = data[None, None, :, :]  # (time, channel, lat, lon)
+        data = data[None, :, :]  # (time, channel, lat, lon)
         return data
 
     @staticmethod
