@@ -289,3 +289,38 @@ class SurfaceDataset:
 def surfaced(dataset: Dataset) -> DelayedDataset:
     """Utility function for concise wrapping."""
     return SurfaceDataset(dataset)
+
+
+class SIVDataset:
+    def __init__(self, sic_dataset, thick_dataset, mesh_mask):
+        self.name = f"{sic_dataset.name}->siv"
+        self.grid_area = mesh_mask.e1t * mesh_mask.e2t
+        self.grid_area = np.where(self.grid_area<1e10, self.grid_area, np.nan)
+        self.sic_dataset = sic_dataset
+        self.thick_dataset = thick_dataset
+        self.grid = sic_dataset.grid
+
+    def __getitem__(self, idx):
+        sic = self.sic_dataset[idx]
+        if np.nanmax(sic) > 1:
+            sic = sic / 100.0
+        thick = self.thick_dataset[idx]
+        # Calculate sea ice volume
+        siv = sic * thick * self.grid_area
+        return siv
+    
+class SIADataset:
+    def __init__(self, sic_dataset, mesh_mask):
+        self.name = f"{sic_dataset.name}->sia"
+        self.grid_area = mesh_mask.e1t * mesh_mask.e2t
+        self.grid_area = np.where(self.grid_area<1e10, self.grid_area, np.nan)
+        self.sic_dataset = sic_dataset
+        self.grid = sic_dataset.grid
+        
+    def __getitem__(self, idx):
+        sic = self.sic_dataset[idx]
+        if np.nanmax(sic) > 1:
+            sic = sic / 100.0
+        # Calculate sea ice volume
+        sia = sic * self.grid_area
+        return sia
