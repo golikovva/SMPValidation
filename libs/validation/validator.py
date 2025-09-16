@@ -17,11 +17,11 @@ class Validator:
 
     def __init__(
         self,
-        datasets: List[Any],
-        metrics: List[Metric],
-        aggregators: List[Aggregator],
-        start_date: datetime.date,
-        end_date: datetime.date,
+        datasets: List[Any] = None,
+        metrics: List[Metric] = None,
+        aggregators: List[Aggregator] = None,
+        start_date: datetime.date = None,
+        end_date: datetime.date = None,
         combinator: object = None,
         load_path: Union[str, None] = None,
     ):
@@ -54,12 +54,11 @@ class Validator:
             mname = metric.name
             self.results[mname] = {}
             # combinations/permutations depending on if order matters
-            idx_combos = list(self.combinator(range(len(self.datasets)), metric.arity))
-            for combo in idx_combos:
-                key = tuple(names[i] for i in combo)
+            combos = self.combinator(names, metric.arity)
+            for combo in combos:
+                key = tuple(name for name in combo)
                 # initialize aggregator accumulators
                 self.results[mname][key] = {}
-                shape = self.datasets[combo[0]].grid.shape
                 for agg in self.aggregators:
                     agg_name = agg.__class__.__name__
                     self.results[mname][key][agg_name] = None  # agg.init_accumulator(shape)
@@ -89,16 +88,12 @@ class Validator:
                     if show_errors:
                         print(ds.name, 'is none for the', date)
                     continue
-                    # arr = np.full((1, *ds.grid.shape), np.nan)
-                # fields.append(arr)
                 fields[ds.name] = arr
-            # print(len(fields), [fields[i].shape for i in range(len(fields))], 'datasets loaded')
             # compute each metric and aggregate
             for metric in self.metrics:
                 combos = self.combinator(fields.keys(), metric.arity)
                 for combo in combos:
                     inputs = [fields[i] for i in combo]
-                    # print([fields[i].shape for i in combo], 'combo shapes')
                     err_field = metric.compute(*inputs)
                     
                     for agg in self.aggregators:
