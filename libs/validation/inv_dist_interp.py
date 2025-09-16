@@ -4,7 +4,7 @@ from sklearn.neighbors import KDTree, BallTree
 
 
 class InvDistTree(torch.nn.Module):
-    def __init__(self, x, q, leaf_size=10, n_near=6, sigma_squared=None,
+    def __init__(self, x, q, leaf_size=10, n_near=6, sigma_squared=None, has_nans=False,
                  distance_metric='euclidean', inv_dist_mode='gaussian', device='cpu'):
         super().__init__()
 
@@ -19,6 +19,7 @@ class InvDistTree(torch.nn.Module):
         self.leaf_size = leaf_size
         self.tree = self.build_tree(distance_metric)  # KDTree(x, leafsize=leaf_size)  # build the tree
         self.calc_interpolation_weights(n_near, sigma_squared)
+        self.nan_sustainable = has_nans
         self.to(device)
 
     def build_tree(self, distance_metric):
@@ -53,7 +54,10 @@ class InvDistTree(torch.nn.Module):
             raise NotImplementedError
 
     def __call__(self, z):
-        res = (z[..., self.ix] * self.weights).sum(-1)
+        if self.nan_sustainable:
+            return self._nan_sustainable_interp(z)
+        else:
+            res = (z[..., self.ix] * self.weights).sum(-1)
         return res
 
     def calc_input_tensor_mask(self, mask_shape, distance_criterion=0.15, fill_value=0):
@@ -63,6 +67,40 @@ class InvDistTree(torch.nn.Module):
         mask[np.where(self.distances.mean(-1) > distance_criterion)] = fill_value
         mask = mask.reshape(*s).to(self.device)
         return mask
+
+    def _nan_sustainable_interp(self, z):
+        """
+        Interpolate using inverse distance weighting, ignoring NaN values in `z`.
+
+        Args:
+            z (torch.Tensor): Input tensor of shape [..., N], where N is the number of data points.
+
+        Returns:
+            torch.Tensor: Interpolated values of shape [..., num_query_points].
+        """
+        # Gather neighbor values: [..., num_query_points, n_near]
+        z_gathered = z[..., self.ix]
+
+        # Create a mask for non-NaN values
+        valid_mask = ~torch.isnan(z_gathered)  # [..., num_query_points, n_near]
+
+        # Set NaNs to zero (to avoid affecting the sum)
+        z_gathered = torch.where(valid_mask, z_gathered, torch.tensor(0.0, device=z_gathered.device))
+
+        # Zero out weights where values are NaN
+        weights_masked = torch.where(valid_mask, self.weights, torch.tensor(0.0, device=self.weights.device))
+
+        # Re-normalize weights to sum to 1 (avoid division by zero)
+        weight_sums = weights_masked.sum(dim=-1, keepdim=True)
+        weights_normalized = torch.where(weight_sums > 0, weights_masked / weight_sums, weights_masked)
+
+        # Compute weighted sum
+        result = (z_gathered * weights_normalized).sum(dim=-1)
+
+        # If all neighbors were NaN, result should be NaN
+        result = torch.where(weight_sums.squeeze(-1) > 0, result, torch.tensor(float('nan'), device=result.device))
+
+        return result
 
 
 def gauss_function(x, sigma_squared=1):
