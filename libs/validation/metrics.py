@@ -73,6 +73,17 @@ class IdentityStat(Metric):
     def compute(self, a):
         return a 
 
+class Times(Metric):
+    name = 'times'
+    arity = 2
+    def compute(self, a, b):
+        return a*b
+
+class Net(Metric):
+    name = 'net'
+    arity = 2
+    def compute(self, a, b):
+        return a*(1 - b)
 
 class StatTransformed(Metric):
     """
