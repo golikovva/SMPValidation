@@ -39,8 +39,7 @@ def fix_quiver_bug(field, lat):
     field_fixed = np.stack([ufield_fixed, vfield]) * old_magnitude / new_magnitude.clip(min=1e-6)
     return field_fixed
 
-
-def create_cartopy(coastline_resolution='110m', figsize=(12, 12)):
+def create_cartopy(coastline_resolution='110m', figsize=(12, 12), fig=None, ax=None):
     """
     Creates a Cartopy map using a North Polar Stereographic projection with adjustable coastline resolution.
 
@@ -54,10 +53,13 @@ def create_cartopy(coastline_resolution='110m', figsize=(12, 12)):
     Returns:
         tuple: A tuple containing the figure and axis with the configured map.
     """
-    fig, ax = plt.subplots(
-        figsize=figsize,
-        subplot_kw={'projection': ccrs.NorthPolarStereo(central_longitude=45.0)}  # North Polar projection
-    )
+    if fig is None:
+        fig, ax = plt.subplots(
+            figsize=figsize,
+            subplot_kw={'projection': ccrs.NorthPolarStereo(central_longitude=45.0)}  # North Polar projection
+        )
+    else:
+        ax = fig.add_subplot(ax, projection=ccrs.NorthPolarStereo(central_longitude=45.0))
 
     ax.set_facecolor(cfeature.COLORS['water'])
     
@@ -131,7 +133,7 @@ def create_cartopy_grid(nrows=1, ncols=1, coastline_resolution='110m', figsize=N
     plt.tight_layout()
     return fig, axes
 
-def visualize_scalar_field(ax, grid, field, if_colorbar=False, **kwargs):
+def visualize_scalar_field(ax, grid, field, if_colorbar=False, lat=None, lon=None, **kwargs):
     """
     Visualizes a scalar field on the map using a color mesh.
 
@@ -142,10 +144,13 @@ def visualize_scalar_field(ax, grid, field, if_colorbar=False, **kwargs):
         vmin (float, optional): Minimum value for color scale. Defaults to None.
         vmax (float, optional): Maximum value for color scale. Defaults to None.
     """
+    lat = lat if lat is not None else grid.latitude
+    lon = lon if lon is not None else grid.longitude
+
     # Create a colored mesh plot of the scalar field, projected using Plate Carree
     layer = ax.pcolormesh(
-        grid.lon,
-        grid.lat,
+        lon,
+        lat,
         field,
         transform=ccrs.PlateCarree(),
         alpha=None,
@@ -177,7 +182,7 @@ def block_average(arr, step, min_valid=None):
     return means
 
 
-def visualize_vector_field(ax, grid, field, key_length=50, key_units='cm/s', key_color='black', 
+def visualize_vector_field(ax, grid, field, key_length=50, draw_quiverkey=True, key_units='cm/s', key_color='black', 
                            from_polar=False, from_direction=True, step=64, use_pooling=True, min_valid=5,
                            scale=None, width=0.002, headwidth=3, headlength=5):
     """
@@ -227,9 +232,9 @@ def visualize_vector_field(ax, grid, field, key_length=50, key_units='cm/s', key
             headwidth=headwidth,
             headlength=headlength
         )
-
-    ax.quiverkey(layer, X=0.69, Y=0.2, U=key_length, label=f'{key_length} {key_units}',
-                 labelpos='E', coordinates='axes')
+    if draw_quiverkey:
+        ax.quiverkey(layer, X=0.69, Y=0.2, U=key_length, label=f'{key_length} {key_units}',
+                    labelpos='E', coordinates='axes')
     return layer
 
 
@@ -598,7 +603,7 @@ def cartesian_to_polar(u: np.ndarray, v: np.ndarray, to_direction=True) -> tuple
 
     return norm, angle_deg
 
-def visualize_full_vector_field(ax, grid, field, key_length=50, key_units='cm/s', key_color='black', 
+def visualize_full_vector_field(ax, grid, field, key_length=50, key_units='cm/s', key_color='black', draw_quiverkey=True,
                                 from_polar=False, from_direction=True, step=32, use_pooling=True,
                                 min_valid=5, scale=None, width=0.002, headwidth=3, headlength=5,
                                 **kwargs):
@@ -612,7 +617,7 @@ def visualize_full_vector_field(ax, grid, field, key_length=50, key_units='cm/s'
         norm, angle = cartesian_to_polar(u, v, to_direction=from_direction)
 
     layer = visualize_scalar_field(ax, grid, norm, if_colorbar=False, **kwargs)
-    visualize_vector_field(ax, grid, (u, v), key_length, key_units, key_color, False, from_direction, step,
+    visualize_vector_field(ax, grid, (u, v), key_length, draw_quiverkey, key_units, key_color, False, from_direction, step,
                            use_pooling=use_pooling, min_valid=min_valid, scale=scale, width=width,
                            headwidth=headwidth, headlength=headlength)
     return layer
