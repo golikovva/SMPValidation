@@ -167,45 +167,46 @@ class RegionalIntegratedTemporalAggregator(RegionalTemporalAggregator):
         super().__init__(region_mask, region_ids)
         self.area_map = area_map
 
-def accumulate(self, acc: Dict[int, Dict[Any, np.ndarray]],
-                   field: np.ndarray,
-                   date: Any) -> None:
-        """
-        field must have last dims (C, H, W).
-        We flatten H×W, then for each channel c do a bincount over region_mask.
-        """
-        if field.ndim == 2:
-            field = field[None]  # 2D field, assume (H, W)
-        if field.ndim < 3:
-            raise ValueError("Field must have at least 3 dims (C, H, W) at the end")
-        C, H, W = field.shape[-3], field.shape[-2], field.shape[-1]
-        if (H, W) != self.region_mask.shape:
-            raise ValueError(f"Field spatial dims {(H,W)} != mask shape {self.region_mask.shape}")
-        
-        if self.area_map is not None:
-            field = field*self.area_map
-        # Flatten
-        flat_mask = self.region_mask.ravel()  # (H*W,)
-        flat_data = field.reshape(C, -1)      # (C, H*W)
+    def accumulate(self, acc: Dict[int, Dict[Any, np.ndarray]],
+                    field: np.ndarray,
+                    date: Any) -> None:
+            """
+            field must have last dims (C, H, W).
+            We flatten H×W, then for each channel c do a bincount over region_mask.
+            """
+            if field.ndim == 2:
+                field = field[None]  # 2D field, assume (H, W)
+            if field.ndim < 3:
+                raise ValueError("Field must have at least 3 dims (C, H, W) at the end")
+            C, H, W = field.shape[-3], field.shape[-2], field.shape[-1]
+            if (H, W) != self.region_mask.shape:
+                raise ValueError(f"Field spatial dims {(H,W)} != mask shape {self.region_mask.shape}")
+            
+            if self.area_map is not None:
+                
+                field = field*self.area_map
+            # Flatten
+            flat_mask = self.region_mask.ravel()  # (H*W,)
+            flat_data = field.reshape(C, -1)      # (C, H*W)
 
-        # Prepare sums & counts arrays
-        sums = np.zeros((C, self.max_label+1), dtype=float)
+            # Prepare sums & counts arrays
+            sums = np.zeros((C, self.max_label+1), dtype=float)
 
-        for c in range(C):
-            vals = flat_data[c]
-            # Sum (NaNs→0)
-            sums[c] = np.bincount(
-                flat_mask,
-                weights=np.nan_to_num(vals, nan=0.0),
-                minlength=self.max_label+1
-            )
+            for c in range(C):
+                vals = flat_data[c]
+                # Sum (NaNs→0)
+                sums[c] = np.bincount(
+                    flat_mask,
+                    weights=np.nan_to_num(vals, nan=0.0),
+                    minlength=self.max_label+1
+                )
 
-        # Compute & store per‐region mean vectors
-        for rid in self.region_ids:
-            # avoid division by zero
-            with np.errstate(divide='ignore', invalid='ignore'):
-                sum_vec = sums[:, rid] 
-            acc[rid][date] = sum_vec
+            # Compute & store per‐region mean vectors
+            for rid in self.region_ids:
+                # avoid division by zero
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    sum_vec = sums[:, rid] 
+                acc[rid][date] = sum_vec
 
 
 class SpatialAggregator(Aggregator):
