@@ -87,7 +87,7 @@ class SeaIceExtentDataset:
         sie = np.where(sic >= self.threshold, 100.0, 0.0)
         return sie
     
-def sic_to_sie(sic_dataset_class):
+def sic_to_sie(sic_dataset_class, threshold=15):
     """
     Decorator that transforms a Sea Ice Concentration (SIC) dataset class 
     into a Sea Ice Extent (SIE) dataset class by applying a 15% threshold.
@@ -117,8 +117,14 @@ def sic_to_sie(sic_dataset_class):
             # First apply the original SIC processing (like land masking)
             field = super()._process_field(field)
             
-            # Apply 15% threshold to convert to binary ice extent
-            sie = (field >= 15).astype(np.float32)
+            # Prepare output: start with NaNs everywhere
+            sie = np.full_like(field, np.nan, dtype=np.float32)
+
+            # Mask of valid values
+            valid = ~np.isnan(field)
+
+            # Apply threshold only to valid pixels
+            sie[valid] = (field[valid] >= threshold).astype(np.float32)
             
             return sie
         
