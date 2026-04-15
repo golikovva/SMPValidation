@@ -1,4 +1,5 @@
 import os
+import warnings
 from abc import abstractmethod
 from pathlib import Path
 from datetime import datetime
@@ -16,9 +17,11 @@ from torch.utils.data import Dataset
 from torch.utils.data.dataloader import default_collate
 from torch.nn.utils.rnn import pack_sequence
 from torch.nn.utils.rnn import PackedSequence
+from addict import Dict
 
 from ..inv_dist_interp import InvDistTree_np, InvDistTree
-
+from libs.validation.interpolator import Interpolator
+from libs.validation import Grid
 
 def atleast_nd(arr, n):
     """
@@ -27,7 +30,6 @@ def atleast_nd(arr, n):
     arr.shape = (1,) * (n - arr.ndim) + arr.shape
     return arr
 
-
 def get_hours_in_period(date, period):
     return ((date.astype(f'datetime64[{period}]') + np.timedelta64(1, period)).astype(f'datetime64[h]') - date.astype(f'datetime64[{period}]')).astype(int)
     
@@ -35,20 +37,39 @@ def lon_to_180_range(lon):
     return (lon + 180) % 360 - 180
 
 class NCs2sDataset(Dataset):
-    def __init__(self, data_folder, data_variables=None, seq_len=4, time_resolution_h=1, add_coords=False, add_time_encoding=False):
+    def __init__(
+            self, 
+            data_folder, 
+            data_variables=None, 
+            seq_len=4, 
+            time_resolution_h=1, 
+            dst_grid=None, 
+            average_times=None, 
+            transform=None,
+            add_coords=False, 
+            add_time_encoding=False, 
+            mask_variable=None, 
+            name=None
+            ):
         super().__init__()
+        self.name = name if name is not None else self.__class__.__name__
         self.path = Path(data_folder)
         self.dates_dict = self._create_dates_dict()
         self.data_variables = data_variables
+        self.dst_grid = dst_grid
 
         self.constant_vars = {}
         self.src_grid = self._create_grid()
-        self.src_grid['longitude'] = lon_to_180_range(self.src_grid['longitude'])   # todo check for tupost/costylnost
+        self.grid = Dict(self.src_grid)
+        self.interpolator = self._create_interpolator()
         self.seq_len = seq_len
         self.file_len = 24
         self.time_res_h = time_resolution_h
         self.add_coords = add_coords
         self.add_time_encoding = add_time_encoding
+        self.average_times = average_times
+        self.mask_variable = mask_variable
+        self.transform = transform
 
     def _create_dates_dict(self):
         result = {}
@@ -66,6 +87,23 @@ class NCs2sDataset(Dataset):
         print(f'parsed {len(result)} dates')
         return result
     
+    def _create_interpolator(self):
+        """
+        Creates an interpolator if a destination grid is specified.
+
+        Returns:
+            Interpolator or None: Interpolator object if dst_grid is provided, else None.
+        """
+        if self.dst_grid is None:
+            return None
+        interpolator = Interpolator(Grid(self.grid.latitude,
+                                         self.grid.longitude),
+                                    Grid(self.dst_grid.latitude,
+                                         self.dst_grid.longitude))  # Initialize interpolator
+        print('initializing interpolator')
+        interpolator.initialize()  # Initialize interpolator settings
+        return interpolator
+
     @abstractmethod
     def _create_grid(self):
         raise NotImplementedError
@@ -78,6 +116,11 @@ class NCs2sDataset(Dataset):
     @property
     @abstractmethod
     def _files_template(self):
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def _file_len(self):
         raise NotImplementedError
 
     @staticmethod
@@ -99,24 +142,33 @@ class NCs2sDataset(Dataset):
     def get_data_by_id(self, date, length=None):
         needed_len = self.seq_len if length is None else length
         npys = []
+        hours_in_file = get_hours_in_period(date, self._file_len)
         hour = (date.astype('datetime64[h]') - date.astype(f'datetime64[{self._file_len}]')).astype(int)
         file = date.astype(f'datetime64[{self._file_len}]')
         while needed_len > 0:
-            times = np.arange(0, get_hours_in_period(date, self._file_len))[hour:hour + needed_len*self.time_res_h:self.time_res_h]
+            times = np.arange(0, hours_in_file)[hour:hour + needed_len*self.time_res_h:self.time_res_h]
             try:
                 file_vars = self.load_file_vars(str(self.dates_dict[file][0]), self.data_variables, times)
             except IndexError:
                 print(date)
                 print("No data for this dates")
                 return None
-            hour = 0
-            file = file + np.timedelta64(1, self._file_len)
+            if self.mask_variable is not None:
+                file_vars *= self.load_file_vars(str(self.dates_dict[file][0]), self.mask_variable, times)
+            hour = self.time_res_h - (hours_in_file-times[-1])
+            file = file + np.timedelta64(1 + hour // hours_in_file, self._file_len)
+            hour = hour % hours_in_file
             npys.append(file_vars)
             needed_len -= len(file_vars)
         return np.concatenate(npys) 
 
     def __getitem__(self, date, length=None, add_coords=None, add_time_encoding=None):
-        data = [self.get_data_by_id(date, length)]
+        if type(date) is not np.datetime64:
+            date = np.datetime64(date).astype(f'datetime64[h]')
+        data = self.get_data_by_id(date, length)
+        if self.transform is not None:
+            data = self.transform(data)
+        data = [data]
         add_coords = self.add_coords if add_coords is None else add_coords
         add_time_encoding = self.add_time_encoding if add_time_encoding is None else add_time_encoding
         if add_coords:
@@ -125,6 +177,19 @@ class NCs2sDataset(Dataset):
             day_encoded, hour_encoded = self.get_day_hour_encoding(date)
             data.extend([np.expand_dims(day_encoded, 1), np.expand_dims(hour_encoded, 1)])
         data = np.concatenate(data, axis=1)
+        
+        if self.average_times is not None:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', category=RuntimeWarning)
+                data = np.nanmean(data[self.average_times], axis=0)
+
+        if self.interpolator is not None:
+            res = []
+            for field in data.reshape(-1, *data.shape[-2:]):
+                interp_field = self.interpolator(field)
+                res.append(interp_field)
+            data = np.stack(res).reshape(*data.shape[:-2], *interp_field.shape[-2:])
+ 
         return data
     
     def get_day_hour_encoding(self, date, frequency=1):
@@ -144,7 +209,7 @@ class NCs2sDataset(Dataset):
         return day_encoded, hour_encoded
 
 
-class GFSDataset(NCs2sDataset):
+class GFSgribDataset(NCs2sDataset):
     def _create_grid(self):
         grid_path = sorted(self.path.glob(self._files_template))[0]
         print(f'loading grid from {grid_path}')
@@ -153,7 +218,7 @@ class GFSDataset(NCs2sDataset):
             grb = ds.read(1)[0]
             # Extract latitude/longitude arrays (2D grids)
             lat, lon = grb.latlons()
-
+        lon = lon_to_180_range(lon) 
         # Create and return a Grid object
         grid = {'longitude': lon, 'latitude': lat}
         return grid
@@ -192,9 +257,55 @@ class GFSDataset(NCs2sDataset):
         return '6h'
 
 
-class WRFs2sDataset(NCs2sDataset):
+class GFSncDataset(NCs2sDataset):
     @staticmethod
     @abstractmethod
+    def _parse_date(file):
+        date_part = file.name.split('_')[-2]
+        date = np.datetime64(date_part)
+        return date
+
+    @property
+    def _files_template(self):
+        return '**/gfs*.nc'
+
+    def _create_grid(self):
+        grid_path = sorted(self.path.glob(self._files_template))[0]
+        print(f'Loading grid from {grid_path}')
+        with xr.open_dataset(grid_path, cache=False) as ds:
+            lon = ds['XLONG'].values[0]
+            lon = lon_to_180_range(lon) 
+            lat = ds['XLAT'].values[0]
+            grid = {'longitude': lon, 'latitude': lat}
+        return grid
+    
+    @property
+    def _file_len(self):
+        return 'D'
+    
+    def get_data_by_id(self, date, length=None):
+        needed_len = self.seq_len if length is None else length
+        npys = []
+        hour = (date.astype('datetime64[h]') - date.astype(f'datetime64[{self._file_len}]')).astype(int)
+        file = date.astype(f'datetime64[{self._file_len}]')
+        while needed_len > 0:
+            print(file)
+            times = np.arange(0, 48)[hour:hour + needed_len*self.time_res_h:self.time_res_h]  # todo fix kostyl
+            try:
+                file_vars = self.load_file_vars(str(self.dates_dict[file][0]), self.data_variables, times)
+            except IndexError:
+                print(date)
+                print("No data for this dates")
+                return None
+            hour = 0
+            file = file + np.timedelta64(1, self._file_len)
+            npys.append(file_vars)
+            needed_len -= len(file_vars)
+        return np.concatenate(npys) 
+
+
+class WRFs2sDataset(NCs2sDataset):
+    @staticmethod
     def _parse_date(file):
         date_part = file.name.split('_')[2]
         date = np.datetime64(date_part)
@@ -209,6 +320,7 @@ class WRFs2sDataset(NCs2sDataset):
         print(f'loading grid from {grid_path}')
         with xr.open_dataset(grid_path, cache=False) as ds:
             lon = ds.coords['XLONG'].values[0]
+            lon = lon_to_180_range(lon) 
             lat = ds.coords['XLAT'].values[0]
             grid = {'longitude': lon, 'latitude': lat}
         return grid
@@ -219,9 +331,8 @@ class WRFs2sDataset(NCs2sDataset):
 
 class ERAs2sDataset(NCs2sDataset):
     @staticmethod
-    @abstractmethod
     def _parse_date(file):
-        date_part = file.name.split('_')[-1]
+        date_part = file.stem.split('_')[-1]
         date = np.datetime64(date_part)
         return date
 
@@ -238,80 +349,27 @@ class ERAs2sDataset(NCs2sDataset):
 
             lat = np.tile(lat_vec, (lon_vec.size, 1)).T
             lon = np.tile(lon_vec, (lat_vec.size, 1))
-
+            lon = lon_to_180_range(lon) 
             grid = {'longitude': lon, 'latitude': lat}
         return grid
     
     @property
     def _file_len(self):
         return 'D'
-        
-class ERAMonthlyDataset(NCs2sDataset):
+
+class ERAMonthlyDataset(ERAs2sDataset):
     @staticmethod
     def _parse_date(file):
         """
         Extract year and month from monthly file name (e.g., ERA5_2023-10.nc).
         """
-        date_part = file.name.split('_')[-1].split('.')[0]  # Extract "2023-10"
+        date_part = file.stem.split('_')[-1].split('.')[0]  # Extract "2023-10"
         date = np.datetime64(date_part + '-01')  # Convert to first day of the month
         return date
-
-    def arange_month(self, date):
-        month = date.astype('datetime64[M]')
-        res = np.arange(
-            month.astype('datetime64[D]'),
-            (month + np.timedelta64(1, 'M')).astype('datetime64[D]'),
-            np.timedelta64(1, 'D')
-        )
-        return res
     
-    @property
-    def _files_template(self):
-        return 'era*.nc'
-
     @property
     def _file_len(self):
         return 'M'
-        
-    def _create_grid(self):
-        """
-        Create grid from the first file.
-        """
-        grid_path = sorted(self.path.glob(self._files_template))[0]
-        print(f'Loading grid from {grid_path}')
-        with xr.open_dataset(grid_path) as ds:
-            lat_vec = ds.coords['latitude'].values
-            lon_vec = ds.coords['longitude'].values
-
-            lat = np.tile(lat_vec, (lon_vec.size, 1)).T
-            lon = np.tile(lon_vec, (lat_vec.size, 1))
-
-            grid = {'longitude': lon, 'latitude': lat}
-        return grid
-        
-class ERAMonthlyDataset_nh(ERAMonthlyDataset):
-    def __init__(self, data_folder, data_variables=None, seq_len=4, time_res_h=6):
-        super().__init__(data_folder, data_variables, seq_len)
-        self.time_res_h = time_res_h
-        
-    def get_data_by_id(self, date, length=None):
-        needed_len = self.seq_len if length is None else length
-        npys = []
-        hour = (date.astype('datetime64[h]') - date.astype(f'datetime64[{self._file_len}]')).astype(int)
-        file = date.astype(f'datetime64[{self._file_len}]')
-        while needed_len > 0:
-            times = np.arange(0, get_hours_in_period(date, self._file_len))[hour:hour + needed_len*self.time_res_h:self.time_res_h]
-            try:
-                file_vars = self.load_file_vars(str(self.dates_dict[file][0]), self.data_variables, times)
-            except IndexError:
-                print(date)
-                print("No data for this dates")
-                return None
-            hour = 0
-            file = file + np.timedelta64(1, self._file_len)
-            npys.append(file_vars)
-            needed_len -= len(file_vars)
-        return np.concatenate(npys) 
 
 
 class ScatterNoneDataset(Dataset):
@@ -421,6 +479,7 @@ class ScatterDataset(Dataset):
         # Create a grid using numpy's tile function
         lat = np.tile(lat_vec, (lon_vec.size, 1)).T
         lon = np.tile(lon_vec, (lat_vec.size, 1))
+        lon = lon_to_180_range(lon) 
 
         # Return the grid as a dictionary
         grid = {'longitude': lon, 'latitude': lat}
@@ -526,6 +585,7 @@ class IFSs2sDataset(NCs2sDataset):
                 lon = ds['longitude'].values
                 if len(lat.shape) == 1:  # 1D vectors
                     lon, lat = np.meshgrid(lon, lat)
+                lon = lon_to_180_range(lon) 
                 grid = {'longitude': lon, 'latitude': lat}
                 self.constant_vars.update(grid)
             else:
