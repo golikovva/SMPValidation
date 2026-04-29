@@ -1,8 +1,13 @@
 import os
+import json
 import warnings
+import re
 from abc import abstractmethod
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
+from collections import OrderedDict
+from collections.abc import Mapping
 import random
 import pickle
 import torch
@@ -23,6 +28,8 @@ from ..inv_dist_interp import InvDistTree_np, InvDistTree
 from libs.validation.interpolator import Interpolator
 from libs.validation import Grid
 
+from time import time
+
 def atleast_nd(arr, n):
     """
     inplace operator to expand array dims up to n dimensional
@@ -35,6 +42,41 @@ def get_hours_in_period(date, period):
     
 def lon_to_180_range(lon):
     return (lon + 180) % 360 - 180
+
+def lat_lon_from_grid(grid):
+    lat_names = ['lat', 'latitude', 'XLAT', 'Latitude']
+    lon_names = ['lon', 'long', 'longitude', 'XLON', 'XLONG', 'Longitude']
+
+    def _looks_like_array(x):
+        # Reject addict auto-created empties / dicts
+        if isinstance(x, Mapping):
+            return False
+        # Accept numpy arrays and array-like objects
+        return isinstance(x, np.ndarray) or hasattr(x, "shape")
+
+    def _get(obj, names):
+        # 1) Mapping path (safe for addict.Dict)
+        if isinstance(obj, Mapping):
+            for name in names:
+                if name in obj:              # does NOT create in addict
+                    val = obj[name]
+                    if _looks_like_array(val):
+                        return val
+
+        # 2) Attribute path (for non-mapping grid objects)
+        for name in names:
+            try:
+                val = getattr(obj, name)
+            except AttributeError:
+                continue
+            if _looks_like_array(val):
+                return val
+
+        return None
+
+    lat = _get(grid, lat_names)
+    lon = _get(grid, lon_names)
+    return lat, lon
 
 class NCs2sDataset(Dataset):
     def __init__(
@@ -96,10 +138,11 @@ class NCs2sDataset(Dataset):
         """
         if self.dst_grid is None:
             return None
+        lat, lon = lat_lon_from_grid(self.dst_grid)
         interpolator = Interpolator(Grid(self.grid.latitude,
                                          self.grid.longitude),
-                                    Grid(self.dst_grid.latitude,
-                                         self.dst_grid.longitude))  # Initialize interpolator
+                                    Grid(lat,
+                                         lon))  # Initialize interpolator
         print('initializing interpolator')
         interpolator.initialize()  # Initialize interpolator settings
         return interpolator
@@ -165,6 +208,7 @@ class NCs2sDataset(Dataset):
     def __getitem__(self, date, length=None, add_coords=None, add_time_encoding=None):
         if type(date) is not np.datetime64:
             date = np.datetime64(date).astype(f'datetime64[h]')
+        data_time = time()
         data = self.get_data_by_id(date, length)
         if self.transform is not None:
             data = self.transform(data)
@@ -210,10 +254,75 @@ class NCs2sDataset(Dataset):
 
 
 class GFSgribDataset(NCs2sDataset):
+    _valid_time_file_re = re.compile(
+        r"gfs_(?P<date>\d{4}-\d{2}-\d{2}|\d{8})_(?P<hour>\d{1,2})(?:\D|$)"
+    )
+    _legacy_init_file_re = re.compile(r"(?:^|\.)(?P<date>\d{10})(?:\.|_)")
+
+    def __init__(
+            self,
+            *args,
+            files_template="**/gfs*.grib2",
+            file_len="6h",
+            variable_match_keys=("shortName", "name", "parameterName"),
+            cache_grib_handles=True,
+            grib_handle_cache_size=8,
+            cache_message_numbers=True,
+            profile_grib_io=False,
+            **kwargs
+            ):
+        self.files_template = files_template
+        self.file_len_value = file_len
+        self.variable_match_keys = variable_match_keys
+        self.cache_grib_handles = cache_grib_handles
+        self.grib_handle_cache_size = int(grib_handle_cache_size)
+        self.cache_message_numbers = cache_message_numbers
+        self.profile_grib_io = profile_grib_io
+        self._grib_handles = OrderedDict()
+        self._message_number_cache = {}
+        super().__init__(*args, **kwargs)
+        self.file_len = get_hours_in_period(np.datetime64("2000-01-01T00"), self._file_len)
+
+    @contextmanager
+    def _open_grib(self, filename):
+        filename = str(filename)
+
+        if not self.cache_grib_handles:
+            with pygrib.open(filename) as ds:
+                yield ds
+            return
+
+        ds = self._grib_handles.pop(filename, None)
+        if ds is None:
+            ds = pygrib.open(filename)
+
+        self._grib_handles[filename] = ds
+
+        while len(self._grib_handles) > self.grib_handle_cache_size:
+            _, old_ds = self._grib_handles.popitem(last=False)
+            close = getattr(old_ds, "close", None)
+            if close is not None:
+                close()
+
+        yield ds
+
+    def close(self):
+        for ds in self._grib_handles.values():
+            close = getattr(ds, "close", None)
+            if close is not None:
+                close()
+        self._grib_handles.clear()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def _create_grid(self):
         grid_path = sorted(self.path.glob(self._files_template))[0]
         print(f'loading grid from {grid_path}')
-        with pygrib.open(grid_path) as ds:
+        with self._open_grib(grid_path) as ds:
             # Read the first message (assuming grid is consistent across messages)
             grb = ds.read(1)[0]
             # Extract latitude/longitude arrays (2D grids)
@@ -223,38 +332,161 @@ class GFSgribDataset(NCs2sDataset):
         grid = {'longitude': lon, 'latitude': lat}
         return grid
 
+    def _variable_selectors(self, variable):
+        if isinstance(variable, dict):
+            return [variable]
+        if isinstance(variable, str):
+            return [{key: variable} for key in self.variable_match_keys]
+        raise TypeError("GFS GRIB variables must be strings or pygrib selector dicts")
+
+    def _variable_cache_key(self, variable):
+        if isinstance(variable, dict):
+            return tuple(sorted(variable.items()))
+        return ("variable", variable, tuple(self.variable_match_keys))
+
+    @staticmethod
+    def _matches_selector(message, selector):
+        return all(getattr(message, key, None) == value for key, value in selector.items())
+
+    def _matches_variable(self, message, variable):
+        return any(
+            self._matches_selector(message, selector)
+            for selector in self._variable_selectors(variable)
+        )
+
+    @staticmethod
+    def _message_number(message):
+        return getattr(message, "messagenumber", None)
+
+    def _select_grib_message(self, ds, variable, filename):
+        cache_key = self._variable_cache_key(variable)
+        cached_number = self._message_number_cache.get(cache_key)
+
+        if self.cache_message_numbers and cached_number is not None:
+            try:
+                message = ds.message(cached_number)
+            except (RuntimeError, ValueError, OSError):
+                message = None
+
+            if message is not None and self._matches_variable(message, variable):
+                return message
+
+            self._message_number_cache.pop(cache_key, None)
+
+        for selector in self._variable_selectors(variable):
+            try:
+                layer = ds.select(**selector)
+            except (RuntimeError, ValueError):
+                continue
+
+            if len(layer) == 1:
+                message = layer[0]
+                message_number = self._message_number(message)
+                if self.cache_message_numbers and message_number is not None:
+                    self._message_number_cache[cache_key] = message_number
+                return message
+            if len(layer) > 1:
+                raise ValueError(
+                    f"{filename}: variable {variable!r} matched {len(layer)} "
+                    f"messages with selector {selector}. Pass a dict selector "
+                    "with typeOfLevel/level/etc. to make it unique."
+                )
+
+        raise KeyError(f"{filename}: no GRIB message matched variable {variable!r}")
+
     def load_file_vars(self, filename, variables, times):
         out = []
-        print(filename)
-        with pygrib.open(filename) as ds:
-            for i in variables:
-                try:
-                    layer = [k for k in ds.select(name=i)]
-                except ValueError:
-                    print('Value Error')
-                # check if param unique in grib
-                if len(layer) != 1:
-                    print(f'file has {len(layer)} params, must be 1')
-                layer = layer[0]
-                geophysical_data, lats, lons = layer.data()
+        if self.profile_grib_io:
+            st = time()
+        with self._open_grib(filename) as ds:
+            if self.profile_grib_io:
+                print(time() - st, "seconds to open file")
+                st = time()
+
+            if variables is None:
+                ds.seek(0)
+                layers = list(ds)
+            else:
+                layers = [
+                    self._select_grib_message(ds, variable, filename)
+                    for variable in variables
+                ]
+
+            if self.profile_grib_io:
+                print(time() - st, "seconds to select variables")
+                st = time()
+
+            for layer in layers:
+                geophysical_data = layer.values
                 out.append(geophysical_data)
+
+            if self.profile_grib_io:
+                print(time() - st, "seconds to load data")
+
         return np.stack(out)[None]
 
     @staticmethod
     def _parse_date(file):
-        # Extract the date part from the filename and parse it
-        date_part = file.stem.split('.')[-2]
-        date = datetime.strptime(date_part, '%Y%m%d%H')  # Parse as 'YYYYMMDDHH'
-        date = np.datetime64(date)
-        return date
+        valid_match = GFSgribDataset._valid_time_file_re.search(file.name)
+        if valid_match is not None:
+            date_part = valid_match.group("date")
+            hour = int(valid_match.group("hour"))
+            if len(date_part) == 8:
+                date = datetime.strptime(date_part, "%Y%m%d")
+            else:
+                date = datetime.strptime(date_part, "%Y-%m-%d")
+            return np.datetime64(date) + np.timedelta64(hour, "h")
+
+        legacy_match = GFSgribDataset._legacy_init_file_re.search(file.name)
+        if legacy_match is not None:
+            date = datetime.strptime(legacy_match.group("date"), '%Y%m%d%H')
+            return np.datetime64(date)
+
+        with pygrib.open(str(file)) as ds:
+            grb = ds.read(1)[0]
+            valid_date = getattr(grb, "validDate", None)
+            if valid_date is None:
+                valid_date = getattr(grb, "analDate")
+                valid_date = valid_date + pd.Timedelta(
+                    hours=int(getattr(grb, "forecastTime", 0))
+                ).to_pytimedelta()
+            return np.datetime64(valid_date).astype("datetime64[h]")
     
     @property
     def _files_template(self):
-        return 'gfs.*.f*.grib2'
+        return self.files_template
     
     @property
     def _file_len(self):
-        return '6h'
+        return self.file_len_value
+
+    def list_data_variables(self, file=None):
+        if file is None:
+            file = sorted(self.path.glob(self._files_template))[0]
+        file = Path(file)
+
+        rows = []
+        with self._open_grib(file) as ds:
+            ds.seek(0)
+            for i, message in enumerate(ds, start=1):
+                row = {
+                    "message": i,
+                    "shortName": getattr(message, "shortName", None),
+                    "name": getattr(message, "name", None),
+                    "parameterName": getattr(message, "parameterName", None),
+                    "typeOfLevel": getattr(message, "typeOfLevel", None),
+                    "level": getattr(message, "level", None),
+                    "units": getattr(message, "units", None),
+                    "forecastTime": getattr(message, "forecastTime", None),
+                    "validDate": getattr(message, "validDate", None),
+                }
+                row["data_variable"] = {
+                    key: row[key]
+                    for key in ("shortName", "typeOfLevel", "level")
+                    if row[key] is not None
+                }
+                rows.append(row)
+        return rows
 
 
 class GFSncDataset(NCs2sDataset):
@@ -383,11 +615,14 @@ class StationsNoneDataset(Dataset):
 
 
 class StationsDataset(Dataset):
-    def __init__(self, stations_folder, data_variables=None, seq_len=4):
+    def __init__(self, stations_folder, data_variables=None, seq_len=4, transform=None, var_dim_first=True, name=None):
         self.path = Path(stations_folder)
         self.station_files = sorted(self.path.glob(self._files_template))
         self.data_variables = data_variables
         self.seq_len = seq_len
+        self.transform = transform
+        self.var_dim_first = var_dim_first
+        self.name = name if name is not None else self.__class__.__name__
 
         self.coords = None
         self.dates = None
@@ -419,6 +654,8 @@ class StationsDataset(Dataset):
         self.stations = stations[:, :, 1:]
         self.coords = np.array(coords)
         self.coords[:, [0, 1]] = self.coords[:, [1, 0]]
+        if self.var_dim_first:
+            stations = np.swapaxes(stations, 1, 2)  # size (40369, 4, 46)
         return stations
 
     def __getitem__(self, date_index, length=None):
@@ -426,12 +663,229 @@ class StationsDataset(Dataset):
         start = date_index
         stop = date_index + np.timedelta64(length-1, 'h')
         ids = self.dates_dict[start:stop]
-        return self.stations[ids]
+        out = self.stations[ids]
+        if self.transform is not None:
+            out = self.transform(out)
+        return out
 
     @property
     def _files_template(self):
         return '*.pkl'
 
+
+class StationsCSVDataset(StationsDataset):
+    """
+    CSV-backed version of StationsDataset.
+
+    Expected file naming:
+        {station_id}_{start_date}_{end_date}.csv
+    for example:
+        01068_2026-01-01_2026-04-22.csv
+
+    Expected CSV structure:
+        time,temp,temp_source,...,wdir,wdir_source,wspd,wspd_source,...
+
+    Parameters
+    ----------
+    stations_folder : str or Path
+        Folder with station CSV files.
+    stations_meta : str | Path | list[dict]
+        Either path to JSON metadata file or already loaded JSON object.
+    data_variables : list[str] | None
+        Variables to extract from CSV. Example:
+        ['temp', 'wspd', 'wdir']
+    seq_len : int
+        Default sequence length for __getitem__.
+    time_column : str
+        Name of the timestamp column in CSV.
+    reindex_full_time : bool
+        If True, builds one common hourly timeline from global min to max time.
+        Missing station values become NaN.
+        This is usually the safest behavior when stations have gaps.
+    """
+
+    def __init__(
+        self,
+        stations_folder,
+        stations_meta,
+        data_variables=None,
+        seq_len=4,
+        time_column="time",
+        reindex_full_time=True,
+        var_dim_first=True,
+        transform=None,
+        name=None
+    ):
+        self.time_column = time_column
+        self.reindex_full_time = reindex_full_time
+
+
+        self.station_ids = []
+        self.names = []
+        self._stations_meta, self._meta_order = self._load_stations_meta(stations_meta)
+
+        super().__init__(
+            stations_folder=stations_folder,
+            data_variables=data_variables,
+            seq_len=seq_len,
+            transform=transform,
+            var_dim_first=var_dim_first,
+            name=name
+        )
+
+    @property
+    def _files_template(self):
+        return "*.csv"
+
+    @staticmethod
+    def _load_stations_meta(stations_meta):
+        if isinstance(stations_meta, (str, Path)):
+            with open(stations_meta, "r", encoding="utf-8") as f:
+                stations_meta = json.load(f)
+
+        meta_dict = {}
+        meta_order = []
+
+        for item in stations_meta:
+            station_id = str(item["id"])
+            meta_dict[station_id] = item
+            meta_order.append(station_id)
+
+        return meta_dict, meta_order
+
+    @staticmethod
+    def _station_id_from_file(file: Path) -> str:
+        # filename example: 01068_2026-01-01_2026-04-22.csv
+        return file.stem.split("_")[0]
+
+    @staticmethod
+    def _station_name_from_meta(meta: dict, fallback: str) -> str:
+        name = meta.get("name", {})
+        if isinstance(name, dict):
+            return name.get("en") or next(iter(name.values()), fallback)
+        if name:
+            return str(name)
+        return fallback
+
+    def _read_single_station_csvs(self, files):
+        frames = []
+
+        for file in sorted(files):
+            df = pd.read_csv(file)
+
+            if self.time_column not in df.columns:
+                raise KeyError(
+                    f"Column '{self.time_column}' not found in station file: {file}"
+                )
+
+            time = pd.to_datetime(df[self.time_column], errors="coerce")
+            if getattr(time.dt, "tz", None) is not None:
+                time = time.dt.tz_localize(None)
+
+            df = df.copy()
+            df[self.time_column] = time.dt.floor("h")
+            df = df.dropna(subset=[self.time_column])
+
+            for var in self.data_variables:
+                if var not in df.columns:
+                    df[var] = np.nan
+
+            df = df[[self.time_column] + list(self.data_variables)]
+
+            for var in self.data_variables:
+                df[var] = pd.to_numeric(df[var], errors="coerce")
+
+            df = df.drop_duplicates(subset=[self.time_column], keep="last")
+            df = df.set_index(self.time_column).sort_index()
+
+            frames.append(df)
+
+        if not frames:
+            raise RuntimeError("No CSV data found for station.")
+
+        df = pd.concat(frames, axis=0)
+        df = df.groupby(level=0).last().sort_index()
+
+        return df
+
+    def _build_common_time_index(self, station_dfs):
+        if not station_dfs:
+            raise RuntimeError("No station dataframes were loaded.")
+
+        if self.reindex_full_time:
+            start = min(df.index.min() for df in station_dfs).floor("h")
+            end = max(df.index.max() for df in station_dfs).floor("h")
+            return pd.date_range(start=start, end=end, freq="1h")
+
+        union_index = station_dfs[0].index
+        for df in station_dfs[1:]:
+            union_index = union_index.union(df.index)
+
+        return pd.DatetimeIndex(union_index).sort_values().unique()
+
+    def load_stations(self, station_files):
+        files_by_station = {}
+        for file in station_files:
+            station_id = self._station_id_from_file(file)
+            files_by_station.setdefault(station_id, []).append(file)
+
+        unknown_station_ids = sorted(set(files_by_station) - set(self._stations_meta))
+        if unknown_station_ids:
+            warnings.warn(
+                "Skipping CSV files with station ids absent from metadata: "
+                + ", ".join(unknown_station_ids)
+            )
+
+        station_ids = [sid for sid in self._meta_order if sid in files_by_station]
+        if not station_ids:
+            raise RuntimeError(
+                f"No usable station CSV files found in {self.path}. "
+                "Check file names and metadata ids."
+            )
+
+        station_dfs = []
+        coords = []
+        names = []
+
+        for station_id in station_ids:
+            meta = self._stations_meta[station_id]
+            df = self._read_single_station_csvs(files_by_station[station_id])
+
+            loc = meta.get("location", {})
+            if "longitude" not in loc or "latitude" not in loc:
+                warnings.warn(f"Skipping station {station_id}: no coordinates in metadata")
+                continue
+
+            station_dfs.append(df)
+            coords.append([float(loc["longitude"]), float(loc["latitude"])])
+            names.append(self._station_name_from_meta(meta, station_id))
+            self.station_ids.append(station_id)
+
+        if not station_dfs:
+            raise RuntimeError("No stations left after metadata/coordinate filtering.")
+
+        common_index = self._build_common_time_index(station_dfs)
+        aligned = [df.reindex(common_index) for df in station_dfs]
+
+        stations = np.stack(
+            [df[self.data_variables].to_numpy(dtype=float) for df in aligned],
+            axis=1,
+        )  # shape: (time, n_stations, n_vars)
+
+        self.dates = common_index.to_numpy().astype("datetime64[h]")
+        self.coords = np.asarray(coords, dtype=float)  # shape: (n_stations, 2) = (lon, lat)
+        self.names = names
+        if self.var_dim_first:
+            stations = np.swapaxes(stations, 1, 2)  # size (time, n_vars, n_stations)
+        return stations
+
+    def __getitem__(self, date_index, length=None):
+        if not isinstance(date_index, np.datetime64):
+            date_index = np.datetime64(date_index).astype("datetime64[h]")
+        return super().__getitem__(date_index, length)
+
+    def __len__(self):
+        return max(0, len(self.dates_dict) - self.seq_len + 1)
 
 class ScatterDataset(Dataset):
     def __init__(self, file_paths, sequence_len=24):
@@ -761,7 +1215,6 @@ def transform_packed_sequence_multiple(
 
     # Создаем новый PackedSequence с преобразованными данными
     return PackedSequence(data, packed.batch_sizes, packed.sorted_indices, packed.unsorted_indices)
-
 
 
 def get_novaya_zemlya_mask(fill_value=torch.nan, return_vertices=False):
