@@ -3,6 +3,7 @@ from typing import Optional, Tuple, List
 from libs.validation.models.partial_conv_2d import local_std
 import numpy as np
 import torch
+from pyproj import Geod
 
 
 class Metric(ABC):
@@ -53,12 +54,20 @@ class MAE(Metric):
     def compute(self, a, b):
         return np.abs(a - b)
 
-class RelativeError(Metric):
-    name = 'relative_error'
+class SkillScore(Metric):
+    name = 'skill_score'
     arity = 2
-    def compute(self, a, b):
+    def compute(self, model_err, ref_err):
         with np.errstate(divide='ignore', invalid='ignore'):
-            return np.abs((a - b) / b) * 100  # Return percentage relative error
+            return ((ref_err - model_err) / ref_err)
+
+class ReversedSkillScore(Metric):
+    name = 'reversed_skill_score'
+    arity = 3
+    def compute(self, model_score, ref_score, perfect_score=1.0):
+        with np.errstate(divide='ignore', invalid='ignore'):
+            return (model_score - ref_score) / (perfect_score - ref_score)
+
 
 class Difference(Metric):
     name = 'difference'
@@ -90,13 +99,18 @@ class StatTransformed(Metric):
     Applies a transformation to the input array.
     """
     name = 'transformed'
-    arity = 1
+    @property
+    def arity(self):
+        return self._arity
 
-    def __init__(self, transform_fn):
+    def __init__(self, transform_fn, arity=1, name=None):
         self.transform_fn = transform_fn
+        self._arity = arity
+        if name is not None:
+            self.name = name
 
-    def compute(self, a):
-        return self.transform_fn(a)
+    def compute(self, *a):
+        return _unpack_tuple(tuple(self.transform_fn(item) for item in a))
     
 
 class StatSquared(StatTransformed):  # usefull to calculate variance
@@ -105,6 +119,27 @@ class StatSquared(StatTransformed):  # usefull to calculate variance
         self.transform_fn = lambda x: x**2
 
     
+# class ApplyToAll(Metric):
+#     """
+#     Applies a given metric to each input field separately.
+#     """
+#     arity = None  # can be set to any value, will be determined by the wrapped metric
+#     def __init__(self, metric: Metric, arity=None):
+#         self.metric = metric
+#         self._arity = arity
+
+#     @property
+#     def name(self):
+#         return f"apply_to_all({self.metric.name})"
+
+#     @property
+#     def arity(self):
+#         return self._arity or self.metric.arity
+
+#     def compute(self, *fields):
+#         return tuple(self.metric.compute(f) for f in fields)
+    
+
 class IdentityOver(Metric):
     """
     Returns a where b is not nan.
@@ -120,18 +155,21 @@ class AngleError(Metric):
     """
     name = 'angle_error'
     arity = 2
+    def __init__(self, var_axis=-3, ):
+        self.var_axis = var_axis
+        self.transform_fn = lambda x: x**2
 
     def compute(self, first: np.ndarray, second: np.ndarray, sensitivity=0.1) -> np.ndarray:
         # Compute the L2 norm of the first and second arrays
-        first_norm = np.linalg.norm(first, axis=-3)
-        second_norm = np.linalg.norm(second, axis=-3)
+        first_norm = np.linalg.norm(first, axis=self.var_axis)
+        second_norm = np.linalg.norm(second, axis=self.var_axis)
 
         # Normalize the input arrays by their respective norms, clipping to avoid division by zero
-        first_normed = first / np.expand_dims(first_norm, -3).clip(min=sensitivity)
-        second_normed = second / np.expand_dims(second_norm, -3).clip(min=sensitivity)
+        first_normed = first / np.expand_dims(first_norm, self.var_axis).clip(min=sensitivity)
+        second_normed = second / np.expand_dims(second_norm, self.var_axis).clip(min=sensitivity)
 
         # Compute the cosine of the angle between first and second using the dot product
-        angle_cos = np.sum(first_normed * second_normed, axis=-3)#.clip(min=-1, max=1)
+        angle_cos = np.sum(first_normed * second_normed, axis=self.var_axis)#.clip(min=-1, max=1)
         # Mask cases where both norms are smaller than the sensitivity threshold (set to NaN)
         angle_cos[(first_norm < sensitivity) & (second_norm < sensitivity)] = np.nan
 
@@ -172,14 +210,26 @@ class VectorAngle(Metric):
                     angle = angle % 360
             res.append(angle)
         return _unpack_tuple(res)
-        
+
+class CircularDifference(Metric):
+    name = 'circular_difference'
+    arity = 2
+    def __init__(self, max_value=360):
+        self.range = max_value
+
+    def compute(self, a, b):
+        diff = a - b
+        diff = (diff + self.range / 2) % self.range - self.range / 2
+        return diff
+
 class VectorNorm(Metric):
     """
     Computes vector norm
     """
     name = 'norm'
-    def __init__(self, arity=1, norm=None):
+    def __init__(self, arity=1, var_axis=-3, norm=None):
         self._arity = arity
+        self.var_axis = var_axis
         self.norm = norm
 
     @property
@@ -191,7 +241,7 @@ class VectorNorm(Metric):
         for vector_field in vector_fields:
             if vector_field.ndim < 3:
                 raise ValueError("Vector field must have at least 3 dimensions (e.g., [dir, lat, lon])")
-            norm = np.linalg.norm(vector_field, axis=-3, ord=self.norm)  # Compute the norm along the vector dimension
+            norm = np.linalg.norm(vector_field, axis=self.var_axis, ord=self.norm)  # Compute the norm along the vector dimension
             res.append(norm)
         return _unpack_tuple(res)
 
@@ -278,7 +328,33 @@ class LocalStd(Metric):
         result[valid_mask] = std_map[valid_mask].astype(np.float32)
         return std_map
 
+class SIEvsSICConfusion(Metric):
+    """
+    Для расчета соответствия однокатегорийных (eg sie) и многокатегорийных (eg sic) 
+    данных морского льда.
+    eg проверить какому распределению концентраций соответствует 1/8 бальная разметка Sentinel-1 
+    """
+    name  = "sic_confusion"
+    arity = 2
 
+    def __init__(self, to_fraction: bool = False, mask: None | np.ndarray = None):
+        """
+        to_fraction=True → вход 0…1, False → 0…100
+        """
+        self.to_fraction = to_fraction
+        self.mask = mask
+
+    def _to_decile(self, x):
+        if self.to_fraction:
+            x = x * 10        # 0…1 → 0…10
+        else:
+            x = x // 10        # 0…100 → 0…10
+        return np.round(x).astype(int)
+
+    def compute(self, sie_reference: np.ndarray, sic_target: np.ndarray) -> np.ndarray:
+        values = self._to_decile(sic_target[np.where(sie_reference == 1)])
+        return np.histogram(values, bins=np.arange(0, 11))[0]
+    
 class SicSuccess(Metric):
     """
     Оправдываемость прогноза сплочённости (sea-ice concentration).
@@ -318,6 +394,87 @@ class SicSuccess(Metric):
         out[mask] = hit.astype(float)
         return out
     
+
+class CategoricalSicSuccess(SicSuccess):
+    """
+    Категориальная оправдываемость прогноза сплочённости (sea-ice concentration).
+
+    Успех = и прогноз, и факт относятся к одной и той же категории сплочённости:
+
+      0 баллов:  Чистая вода (нет льда).
+      1-3 балла: Редкий лед.
+      4-6 баллов: Разреженный лед.
+      7-8 баллов: Сплоченный лед.
+      9-10 баллов: Очень сплоченный / сплошной лед.
+
+    Возвращает поле из 1 / 0 / NaN.
+    NaN — там, где входные данные не заданы или не попали ни в одну категорию.
+    """
+    name  = "sic_categorical_success"
+    arity = 2
+
+    def __init__(
+        self,
+        to_fraction: bool = False,
+        mask: None | np.ndarray = None,
+        categories: Optional[List[Tuple[int, int]]] = None,
+    ):
+        """
+        to_fraction=True → вход 0…1, False → 0…100.
+
+        categories — список диапазонов в баллах (включительно).
+        По умолчанию используются:
+            (0, 0), (1, 3), (4, 6), (7, 8), (9, 10)
+        """
+        super().__init__(to_fraction=to_fraction, mask=mask)
+        if categories is None:
+            categories = [
+                (0, 0),   # чистая вода
+                (1, 3),   # редкий лед
+                (4, 6),   # разреженный лед
+                (7, 8),   # сплоченный лед
+                (9, 10),  # очень сплоченный / сплошной лед
+            ]
+        self.categories = categories
+
+    def _to_category(self, deciles: np.ndarray) -> np.ndarray:
+        """
+        Перевод баллов (0-10) в номер категории (0, 1, 2, ...).
+        Если балл не попал ни в одну категорию — возвращается -1.
+        """
+        cat = np.full_like(deciles, -1, dtype=int)
+        for idx, (lo, hi) in enumerate(self.categories):
+            m = (deciles >= lo) & (deciles <= hi)
+            cat[m] = idx
+        return cat
+
+    def compute(self, prog: np.ndarray, obs: np.ndarray) -> np.ndarray:
+        # базовая маска по данным + внешняя маска, как в SicSuccess
+        mask = np.ones_like(prog, dtype=bool) if self.mask is None else self.mask
+        mask = np.isfinite(prog) & np.isfinite(obs) & mask
+
+        out = np.full_like(prog, np.nan, dtype=float)
+
+        # Перевод в баллы 0–10 с учетом to_fraction
+        p_dec = self._to_decile(prog[mask])
+        o_dec = self._to_decile(obs[mask])
+
+        # Перевод баллов в категории
+        p_cat = self._to_category(p_dec)
+        o_cat = self._to_category(o_dec)
+
+        # Отбрасываем точки, не попавшие ни в одну категорию
+        valid = (p_cat >= 0) & (o_cat >= 0)
+
+        # Успех = одна и та же категория
+        hit_valid = (p_cat == o_cat) & valid
+
+        # Собираем локальный результат и возвращаем в исходную сетку
+        local_out = np.full(p_dec.shape, np.nan, dtype=float)
+        local_out[valid] = hit_valid[valid].astype(float)
+
+        out[mask] = local_out
+        return out
 
 class DriftSuccess(Metric):
     name = "drift_success"
@@ -481,3 +638,21 @@ def efficiency_wrapper(success_cls):
         "Wrapped as an efficiency metric. See efficiency_wrapper()."
     )
     return EfficiencyMetric
+
+
+class GreatCircleDistance(Metric):
+    """
+    Computes the great circle distance between two points on a sphere given their latitudes and longitudes.
+    The input arrays should have the last dimension of size 2, where the first element is latitude and the second is longitude.
+    """
+    name = 'great_circle_distance'
+    arity = 2
+    _WGS84_GEOD = Geod(ellps="WGS84")
+    def compute(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        lat1 = a[..., 0]
+        lon1 = a[..., 1]
+        lat2 = b[..., 0]
+        lon2 = b[..., 1]
+        az_deg, _, dist_m = self._WGS84_GEOD.inv(lon1, lat1, lon2, lat2)
+        return dist_m
+    
