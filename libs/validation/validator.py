@@ -13,6 +13,9 @@ from .metrics import Metric
 class Validator:
     """
     Validator orchestrates computation of metrics over datasets and aggregation.
+
+    ``input_adapter`` prepares each metric's inputs and their shared context.
+    It defaults to ArrayInputAdapter for existing grid-based validations.
     """
 
     def __init__(
@@ -22,22 +25,34 @@ class Validator:
         aggregators: List[Aggregator] = None,
         start_date: datetime.date = None,
         end_date: datetime.date = None,
+        date_step: str = 'D',
         combinator: object = None,
         load_path: Union[str, None] = None,
+        *,
+        input_adapter=None,
     ):
+        if input_adapter is None:
+            # Import lazily: dataset utilities also use MetricField from here.
+            from .datasets.input_adapters import ArrayInputAdapter
+
+            input_adapter = ArrayInputAdapter()
         self.datasets = datasets
         self.metrics = metrics
         self.aggregators = aggregators
         self.start_date = start_date
         self.end_date = end_date
+        self.date_step = date_step
         self.processed_dates = set()
         self.combinator = combinator or itertools.combinations
+        self.input_adapter = input_adapter
         if load_path:
             self._load_result(load_path)
         else:
             self._init_result()
 
     def _make_date_list(self) -> List[datetime.date]:
+        dates = np.arange(self.start_date, self.end_date + np.timedelta64(1, self.date_step), np.timedelta64(1, self.date_step))
+        return dates.astype('O').tolist()
         days = (self.end_date - self.start_date).days
         return [self.start_date + datetime.timedelta(days=i) for i in range(days)]
 
@@ -67,6 +82,8 @@ class Validator:
         """
         Run validation over the specified date range (or provided list of dates).
         """
+        from .datasets.input_adapters import make_metric_field
+
         if dates is None:
             dates = self._make_date_list()
 
@@ -94,7 +111,17 @@ class Validator:
                 combos = self.combinator(fields.keys(), metric.arity)
                 for combo in combos:
                     inputs = [fields[i] for i in combo]
-                    err_field = metric.compute(*inputs)
+                    prepared = self.input_adapter.prepare(inputs, metric=metric)
+                    if not prepared.has_valid_samples:
+                        continue
+
+                    errors = metric.compute(*prepared.arrays)
+                    err_field = make_metric_field(
+                        errors,
+                        metric=metric,
+                        context=prepared.context,
+                        input_dims=prepared.input_dims,
+                    )
                     
                     for agg in self.aggregators:
                         agg_name = agg.__class__.__name__
@@ -110,6 +137,7 @@ class Validator:
         """
         Finalize all aggregators and return summarized results.
         Returns a nested dict keyed by metric, metric_key, aggregator_name.
+        Entries without any valid samples remain None.
         """
         summary: Dict[str, Dict[Tuple[str,...], Dict[str, Any]]] = {}
         for mname, combos in self.results.items():
@@ -117,6 +145,9 @@ class Validator:
             for key, aggs in combos.items():
                 summary[mname][key] = {}
                 for agg_name, acc in aggs.items():
+                    if acc is None:
+                        summary[mname][key][agg_name] = None
+                        continue
                     # find aggregator class by name
                     agg = next(a for a in self.aggregators if a.__class__.__name__ == agg_name)
                     summary[mname][key][agg_name] = agg.finalize(acc)
@@ -136,3 +167,25 @@ class Validator:
             data = pickle.load(f)
         self.results = data['results']
         self.processed_dates = data['processed_dates']
+
+class MetricField(np.ndarray):
+    """
+    ndarray with attached metadata.
+    Ordinary aggregators can use it as a normal array.
+    Special aggregators can read .meta.
+    """
+
+    def __new__(cls, input_array, **meta):
+        obj = np.asarray(input_array).view(cls)
+        obj.meta = dict(meta)
+        return obj
+
+    def __array_finalize__(self, obj):
+        if obj is None:
+            return
+        self.meta = getattr(obj, "meta", {})
+
+    def get_meta(self, key=None, default=None):
+        if key is None:
+            return self.meta
+        return self.meta.get(key, default)
