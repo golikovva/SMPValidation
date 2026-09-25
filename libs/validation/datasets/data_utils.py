@@ -210,6 +210,8 @@ class NCs2sDataset(Dataset):
             date = np.datetime64(date).astype(f'datetime64[h]')
         data_time = time()
         data = self.get_data_by_id(date, length)
+        if data is None:
+            return None
         if self.transform is not None:
             data = self.transform(data)
         data = [data]
@@ -269,6 +271,7 @@ class GFSgribDataset(NCs2sDataset):
             grib_handle_cache_size=8,
             cache_message_numbers=True,
             profile_grib_io=False,
+            require_aligned_time=False,
             **kwargs
             ):
         self.files_template = files_template
@@ -278,6 +281,7 @@ class GFSgribDataset(NCs2sDataset):
         self.grib_handle_cache_size = int(grib_handle_cache_size)
         self.cache_message_numbers = cache_message_numbers
         self.profile_grib_io = profile_grib_io
+        self.require_aligned_time = require_aligned_time
         self._grib_handles = OrderedDict()
         self._message_number_cache = {}
         super().__init__(*args, **kwargs)
@@ -424,6 +428,24 @@ class GFSgribDataset(NCs2sDataset):
                 print(time() - st, "seconds to load data")
 
         return np.stack(out)[None]
+
+    def _time_offset_in_file_h(self, date):
+        date = date.astype("datetime64[h]")
+        file_time = date.astype(f"datetime64[{self._file_len}]").astype("datetime64[h]")
+        return int((date - file_time).astype("timedelta64[h]").astype(int))
+
+    def _is_request_aligned(self, date, length=None):
+        needed_len = self.seq_len if length is None else length
+        dates = (
+            date.astype("datetime64[h]")
+            + np.arange(needed_len) * np.timedelta64(self.time_res_h, "h")
+        )
+        return all(self._time_offset_in_file_h(d) == 0 for d in dates)
+
+    def get_data_by_id(self, date, length=None):
+        if self.require_aligned_time and not self._is_request_aligned(date, length):
+            return None
+        return super().get_data_by_id(date, length)
 
     @staticmethod
     def _parse_date(file):
@@ -678,9 +700,9 @@ class StationsCSVDataset(StationsDataset):
     CSV-backed version of StationsDataset.
 
     Expected file naming:
-        {station_id}_{start_date}_{end_date}.csv
+        {station_id}_{station_name}_{start_date}_{end_date}.csv
     for example:
-        01068_2026-01-01_2026-04-22.csv
+        01068_Honningsvag-Airport_2026-01-01_2026-04-22.csv
 
     Expected CSV structure:
         time,temp,temp_source,...,wdir,wdir_source,wspd,wspd_source,...
@@ -755,7 +777,7 @@ class StationsCSVDataset(StationsDataset):
 
     @staticmethod
     def _station_id_from_file(file: Path) -> str:
-        # filename example: 01068_2026-01-01_2026-04-22.csv
+        # filename example: 01068_Honningsvag-Airport_2026-01-01_2026-04-22.csv
         return file.stem.split("_")[0]
 
     @staticmethod
