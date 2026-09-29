@@ -1,10 +1,10 @@
 from datetime import datetime  # For handling and manipulating date and time objects
 
 import xarray as xr  # For working with labeled multi-dimensional arrays (NetCDF format)
-
+import numpy as np  # For numerical operations on arrays
 from libs.validation import Grid  # Import custom Grid class from boreylib
 from libs.validation.datasets.base import ModelThickDataset  # Import base class for thickness datasets
-
+from libs.validation.grid_utils import grid_lat_lon_2d  # Import utility function to extract lat/lon from grid
 
 class CryosatThickDataset(ModelThickDataset):
     """
@@ -13,7 +13,10 @@ class CryosatThickDataset(ModelThickDataset):
     This class manages grid creation, data extraction, and parsing dates from CryoSat files.
     """
 
-    def __init__(self, path, dst_grid=None, average_times=None, name=None):
+    def __init__(
+        self, path, dst_grid=None, average_times=None, name=None, lats_slice=None,
+        *, files_template=None, interpolation_cache_dir=None,
+    ):
         """
         Initializes the CryosatThickDataset object.
 
@@ -22,8 +25,17 @@ class CryosatThickDataset(ModelThickDataset):
             dst_grid (Grid, optional): The destination grid for interpolation (optional).
             average_times (list, optional): Time indices for averaging (optional).
             name (str, optional): Name of the dataset (optional).
+            interpolation_cache_dir (str or Path, optional): Directory for reusable
+                interpolation weights. None disables the disk cache.
         """
-        super().__init__(path, dst_grid, average_times, name)  # Call the base class constructor
+        if lats_slice is None:
+            lats_slice = slice(-300, None)
+        self.lats_slice = lats_slice
+
+        super().__init__(
+            path, dst_grid, average_times, name, files_template=files_template,
+            interpolation_cache_dir=interpolation_cache_dir,
+        )  # Call the base class constructor
 
     def _create_grid(self):
         """
@@ -38,8 +50,10 @@ class CryosatThickDataset(ModelThickDataset):
 
         # Load the dataset to extract latitude and longitude
         ds = xr.open_dataset(grid_path)
-        lat = ds.variables['lat'].values  # Extract latitude values
-        lon = ds.variables['lon'].values  # Extract longitude values
+        lat, lon = grid_lat_lon_2d(ds)
+        # lat = ds['latitude'].values[self.lats_slice]  # Extract latitude values
+        # lon = ds['longitude'].values  # Extract longitude values
+        # lat, lon = np.meshgrid(lat, lon, indexing='ij')  # Create 2D meshgrid
 
         # Create a Grid object with the extracted latitude and longitude
         grid = Grid(lat, lon)
@@ -57,27 +71,37 @@ class CryosatThickDataset(ModelThickDataset):
             datetime.date: The middle date between start and end dates.
         """
         # Extract date parts from the filename
-        parts = file.name.split('_')
-        start_date_str = parts[8]  # Extract the start date as string
-        end_date_str = parts[9]  # Extract the end date as string
+        dates = file.name.split('_')[-1]
+        date = '-'.join(dates.split('-')[:3])
 
         # Convert string dates to datetime objects
-        start_date = datetime.strptime(start_date_str, "%Y%m%d")
-        end_date = datetime.strptime(end_date_str, "%Y%m%d")
+        date = datetime.strptime(date, "%Y-%m-%d").date()
+        return date
+    
+    def _process_field(self, field):
+        """
+        Processes the thickness data by applying masking.
 
-        # Calculate the middle date between start and end
-        middle_date = start_date + (end_date - start_date) / 2
-        return middle_date.date()  # Return the date part
+        Args:
+            field (np.array): Raw thickness data.
+
+        Returns:
+            np.array: Processed thickness data.
+        """
+        # field = field[:, self.lats_slice]
+        field = np.nan_to_num(field, nan=0.0)  # Replace NaNs with 0.0
+        field[:, self.src_grid.land_mask()] = np.nan  # Apply land mask
+        return field
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Provides the file template pattern for locating CryoSat sea ice thickness data files.
 
         Returns:
             str: The template string for file paths.
         """
-        return 'SEAICE_ARC_PHY_L4_NRT_011_014/esa_obs-si_arc_phy-sit_nrt_l4_multi_P1D-m_202207/**/*.nc'
+        return 'esa_obs-si_arc_phy-sit_nrt_l4-*.nc'  # Template for CryoSat thickness data files
 
     @property
     def _thick_variable(self):
@@ -87,4 +111,4 @@ class CryosatThickDataset(ModelThickDataset):
         Returns:
             str: The variable name for sea ice thickness.
         """
-        return 'analysis_sea_ice_thickness'  # The variable name in the dataset for sea ice thickness
+        return 'sea_ice_thickness'  # The variable name in the dataset for sea ice thickness

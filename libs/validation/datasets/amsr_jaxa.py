@@ -103,7 +103,7 @@ class AmsrJaxaHsi25kmDataset(AmsrJaxaHsiDataset):
     """
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Defines the file naming template for 25km HSI data.
 
@@ -129,7 +129,7 @@ class AmsrJaxaHsi10kmDataset(AmsrJaxaHsiDataset):
     """
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Defines the file naming template for 10km HSI data.
 
@@ -171,7 +171,7 @@ class AmsrJaxaSimRDataset(Dataset):
         return grid
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Defines the file naming template for SIM-R data.
 
@@ -263,7 +263,7 @@ class AmsrJaxaSimYDataset(Dataset):
         return grid
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Defines the file naming template for SIM-Y data.
 

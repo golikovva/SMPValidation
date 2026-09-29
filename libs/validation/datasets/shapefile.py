@@ -14,7 +14,17 @@ class ShapefileSicDataset(Dataset):
     This dataset is grid-based and converts sea ice grades into percentages.
     """
 
-    def __init__(self, path, resolution=5.0, dst_grid=None, average_times=None, name=None):
+    def __init__(
+        self,
+        path,
+        resolution=5.0,
+        dst_grid=None,
+        average_times=None,
+        name=None,
+        *,
+        files_template=None,
+        interpolation_cache_dir=None,
+    ):
         """
         Initializes the ShapefileSicDataset with the specified resolution and parameters.
 
@@ -24,9 +34,19 @@ class ShapefileSicDataset(Dataset):
             dst_grid (Grid, optional): Destination grid for interpolation.
             average_times (list, optional): Time indices to average over.
             name (str, optional): Name of the dataset.
+            files_template (str, optional): Override for the dataset file template.
+            interpolation_cache_dir (str or Path, optional): Directory for reusable
+                interpolation weights. None disables the disk cache.
         """
         self.resolution = resolution  # Set the resolution
-        super().__init__(path, dst_grid, average_times, name)  # Initialize the base Dataset class
+        super().__init__(
+            path=path,
+            dst_grid=dst_grid,
+            average_times=average_times,
+            name=name,
+            files_template=files_template,
+            interpolation_cache_dir=interpolation_cache_dir,
+        )  # Initialize the base Dataset class
 
     def _create_grid(self):
         """
@@ -83,7 +103,7 @@ class ShapefileSicDataset(Dataset):
         return date
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Returns the template for matching SIC data files based on the resolution.
 
@@ -99,7 +119,17 @@ class ShapefileDriftDataset(Dataset):
     This dataset loads ice drift data and maps it to specific regions.
     """
 
-    def __init__(self, path, region, dst_grid=None, average_times=None, name=None):
+    def __init__(
+        self,
+        path,
+        region,
+        dst_grid=None,
+        average_times=None,
+        name=None,
+        *,
+        files_template=None,
+        interpolation_cache_dir=None,
+    ):
         """
         Initializes the ShapefileDriftDataset with the specified region and parameters.
 
@@ -109,10 +139,20 @@ class ShapefileDriftDataset(Dataset):
             dst_grid (Grid, optional): Destination grid for interpolation.
             average_times (list, optional): Time indices to average over.
             name (str, optional): Name of the dataset.
+            files_template (str, optional): Override for the dataset file template.
+            interpolation_cache_dir (str or Path, optional): Directory for reusable
+                interpolation weights. None disables the disk cache.
         """
         self.shp_df = None  # Initialize the shapefile DataFrame to None
         self.region = region  # Set the region
-        super().__init__(path, dst_grid, average_times, name)
+        super().__init__(
+            path=path,
+            dst_grid=dst_grid,
+            average_times=average_times,
+            name=name,
+            files_template=files_template,
+            interpolation_cache_dir=interpolation_cache_dir,
+        )
 
         # Load the grids mapping for drift data
         with open(self.path / 'grids_mapping.pkl', 'rb') as f:
@@ -192,7 +232,7 @@ class ShapefileDriftDataset(Dataset):
         raise NotImplementedError
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         This method should be implemented for providing the file template.
 
@@ -208,7 +248,17 @@ class ShapefileThickDataset(Dataset):
     This dataset is grid-based and loads thickness data with the specified resolution.
     """
 
-    def __init__(self, path, resolution=5.0, dst_grid=None, average_times=None, name=None):
+    def __init__(
+        self,
+        path,
+        resolution=5.0,
+        dst_grid=None,
+        average_times=None,
+        name=None,
+        *,
+        files_template=None,
+        interpolation_cache_dir=None,
+    ):
         """
         Initializes the ShapefileThickDataset with the specified resolution and parameters.
 
@@ -218,9 +268,19 @@ class ShapefileThickDataset(Dataset):
             dst_grid (Grid, optional): Destination grid for interpolation.
             average_times (list, optional): Time indices to average over.
             name (str, optional): Name of the dataset.
+            files_template (str, optional): Override for the dataset file template.
+            interpolation_cache_dir (str or Path, optional): Directory for reusable
+                interpolation weights. None disables the disk cache.
         """
         self.resolution = resolution  # Set the resolution
-        super().__init__(path, dst_grid, average_times, name)
+        super().__init__(
+            path=path,
+            dst_grid=dst_grid,
+            average_times=average_times,
+            name=name,
+            files_template=files_template,
+            interpolation_cache_dir=interpolation_cache_dir,
+        )
 
     def _create_grid(self):
         """
@@ -276,7 +336,7 @@ class ShapefileThickDataset(Dataset):
         return date
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Returns the template for matching thickness data files based on the resolution.
 

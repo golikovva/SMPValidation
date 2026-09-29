@@ -13,10 +13,16 @@ class Amsr2Dataset(Dataset):
     Base class for AMSR JAXA HSI datasets, which defines common grid creation,
     data processing, and extraction methods for handling HSI data files.
     """
-    def __init__(self, path, dst_grid=None, average_times=None, name=None, grid_file=None):
+    def __init__(
+        self, path, dst_grid=None, average_times=None, name=None, grid_file=None,
+        *, files_template=None, interpolation_cache_dir=None,
+    ):
         assert grid_file is not None, 'Please specify grid_file argument if using this subclass'
         self.grid_file = grid_file
-        super().__init__(path, dst_grid, average_times, name)
+        super().__init__(
+            path, dst_grid, average_times, name, files_template=files_template,
+            interpolation_cache_dir=interpolation_cache_dir,
+        )
 
     def _create_grid(self, load_fn=xr.open_dataset):
         """
@@ -93,7 +99,7 @@ class Amsr2HSIDataset(Amsr2Dataset):
     """
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Defines the file naming template for 10km HSI data.
 

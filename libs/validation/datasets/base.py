@@ -20,9 +20,20 @@ class Dataset(ABC):
         dates_dict (dict): Dictionary mapping dates to file paths.
         src_grid (Grid): Source grid containing the data.
         interpolator (Interpolator): Interpolator for regridding the data.
+        interpolation_cache_dir (str or Path or None): Optional directory for
+            persistent interpolation weights.
     """
 
-    def __init__(self, path, dst_grid=None, average_times=None, name=None):
+    def __init__(
+        self,
+        path,
+        dst_grid=None,
+        average_times=None,
+        name=None,
+        *,
+        files_template=None,
+        interpolation_cache_dir: str | Path | None = None,
+    ):
         """
         Initializes the Dataset class with the path, grid, and other configurations.
 
@@ -31,15 +42,20 @@ class Dataset(ABC):
             dst_grid (Grid, optional): Destination grid for interpolation.
             average_times (list, optional): Time indices to average over.
             name (str, optional): Name of the dataset.
+            files_template (str, optional): Template for locating data files.
+            interpolation_cache_dir (str or Path, optional): Directory for reusable
+                interpolation weights. None disables the disk cache.
 
         Raises:
             ValueError: If dst_grid is provided but average_times is not.
         """
         super().__init__()
+        self._files_template_override = files_template
         self.path = Path(path)  # Convert path to Path object
         self.dst_grid = dst_grid
         self.average_times = average_times
         self.name = name
+        self.interpolation_cache_dir = interpolation_cache_dir
 
         # Optional: Print dataset initialization message
         if self.name is not None:
@@ -82,10 +98,10 @@ class Dataset(ABC):
             return None
         interpolator = Interpolator(self.src_grid, self.dst_grid)  # Initialize interpolator
         print('initializing interpolator')
-        interpolator.initialize()  # Initialize interpolator settings
+        interpolator.initialize(cache_dir=self.interpolation_cache_dir)
         return interpolator
 
-    def __getitem__(self, date):
+    def __getitem__(self, date, average_times=None):
         """
         Retrieves and processes the data for a specific date.
 
@@ -107,6 +123,7 @@ class Dataset(ABC):
         result = np.concatenate(result, axis=0)  # Concatenate along the time dimension
 
         # Average the data over the specified times if provided
+        average_times = average_times if average_times is not None else self.average_times
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', category=RuntimeWarning)
             result = np.nanmean(result[self.average_times], axis=0)  # Apply averaging
@@ -204,15 +221,21 @@ class Dataset(ABC):
         raise NotImplementedError
 
     @property
+    def _files_template(self) -> str:
+        """Return the instance override or the subclass-specific default."""
+        if self._files_template_override is not None:
+            return self._files_template_override
+        return self._default_files_template
+
+    @property
     @abstractmethod
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
-        Abstract property that defines the file template for locating dataset files.
+        Abstract property defining the default template for locating dataset files.
 
         Must be implemented by subclasses.
         """
         raise NotImplementedError
-
 
 class ModelSicDataset(Dataset):
     """
@@ -336,7 +359,7 @@ class ModelThickDataset(Dataset):
         Returns:
             np.array: Processed thickness data.
         """
-        field = np.nan_to_num(field, nan=0.0)  # Replace NaNs with 0.0
+        # field = np.nan_to_num(field, nan=0.0)  # Replace NaNs with 0.0
         field[:, self.src_grid.land_mask()] = np.nan  # Apply land mask
         return field
 
