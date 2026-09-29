@@ -17,9 +17,16 @@ class ConstantDataset(Dataset):
         end_date (datetime.date): The end date for the dataset.
     """
 
-    def __init__(self, grid, value=0.0, name=None,
-                 start_date=datetime.date(2000, 1, 1),
-                 end_date=datetime.date(2030, 1, 1)):
+    def __init__(
+        self,
+        grid,
+        value=0.0,
+        name=None,
+        start_date=datetime.date(2000, 1, 1),
+        end_date=datetime.date(2030, 1, 1),
+        *,
+        files_template=None,
+    ):
         """
         Initializes the ConstantDataset with a grid and a constant value.
 
@@ -29,11 +36,18 @@ class ConstantDataset(Dataset):
             name (str, optional): The name of the dataset. Defaults to None.
             start_date (datetime.date, optional): The start date for the dataset. Defaults to January 1, 2000.
             end_date (datetime.date, optional): The end date for the dataset. Defaults to January 1, 2030.
+            files_template (str, optional): Override for the dataset file template.
         """
         self.src_grid = grid  # Set the source grid
         self.start_date = start_date  # Set the start date
         self.end_date = end_date  # Set the end date
-        super().__init__(path='', dst_grid=None, average_times=None, name=name)
+        super().__init__(
+            path='',
+            dst_grid=None,
+            average_times=None,
+            name=name,
+            files_template=files_template,
+        )
 
         # Store the constant value as an array
         if isinstance(value, (int, float)):
@@ -107,7 +121,7 @@ class ConstantDataset(Dataset):
         raise NotImplementedError
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Not implemented for this dataset, as there are no files to match.
 
@@ -126,7 +140,10 @@ class FusionDataset(Dataset):
         datasets (list): A list of datasets to be fused.
     """
 
-    def __init__(self, datasets, dst_grid=None, name=None):
+    def __init__(
+        self, datasets, dst_grid=None, name=None,
+        *, files_template=None, interpolation_cache_dir=None,
+    ):
         """
         Initializes the FusionDataset with a list of datasets to combine.
 
@@ -134,9 +151,19 @@ class FusionDataset(Dataset):
             datasets (list): A list of datasets to be combined.
             dst_grid (Grid, optional): The destination grid for interpolation. Defaults to None.
             name (str, optional): The name of the dataset. Defaults to None.
+            files_template (str, optional): Override for the dataset file template.
+            interpolation_cache_dir (str or Path, optional): Directory for reusable
+                interpolation weights. None disables the disk cache.
         """
         self.datasets = datasets  # Store the datasets to be fused
-        super().__init__(path='', dst_grid=dst_grid, average_times=slice(None), name=name)
+        super().__init__(
+            path='',
+            dst_grid=dst_grid,
+            average_times=slice(None),
+            name=name,
+            files_template=files_template,
+            interpolation_cache_dir=interpolation_cache_dir,
+        )
 
     def _create_dates_dict(self):
         """
@@ -196,7 +223,7 @@ class FusionDataset(Dataset):
         raise NotImplementedError
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Not implemented for this dataset.
 
