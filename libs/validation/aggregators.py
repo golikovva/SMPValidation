@@ -1,6 +1,6 @@
 import numpy as np
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Tuple, Sequence
+from typing import Any, Dict, List, Tuple, Sequence, Iterable
 import warnings
 import torch
 from libs.validation.inv_dist_interp import InvDistTree
@@ -10,6 +10,10 @@ class Aggregator(ABC):
     """
     Abstract base class for aggregators that collect statistics from pointwise fields.
     """
+    def __init__(self, space_arity=2):
+        super().__init__()
+        self.space_arity = space_arity
+
 
     @abstractmethod
     def init_accumulator(self, shape: Tuple[int, ...]) -> Any:
@@ -48,14 +52,22 @@ class GlobalTemporalAggregator(Aggregator):
         return {}
 
     def accumulate(self, acc: Dict[Any, float], field: np.ndarray, date: Any) -> None:
+        if field.ndim < self.space_arity:
+            raise ValueError(
+                f"field.ndim={field.ndim} is smaller than space_arity={self.space_arity}. "
+                f"Cannot reduce last {self.space_arity} dims."
+            )
+        space_axes = tuple(range(field.ndim - self.space_arity, field.ndim))
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', category=RuntimeWarning)
-            mean_over_space = np.nanmean(field, axis=(-2, -1))
-        acc[date] = mean_over_space
+            mean_over_space = np.nanmean(field, axis=space_axes)
+        acc[date] = {'sum': np.nansum(field, axis=space_axes), 'count': np.sum(~np.isnan(field), axis=space_axes)}
+        # acc[date] = mean_over_space
     
     @staticmethod
     def finalize(acc: Dict[Any, np.ndarray]) -> Dict[Any, np.ndarray]:
-        return acc
+        return {date: (v['sum'] / v['count']) if v['count'] > 0 else np.nan for date, v in acc.items()}
+        # return acc
 
 
 class GlobalIntegratedTemporalAggregator(GlobalTemporalAggregator):
@@ -149,11 +161,13 @@ class RegionalTemporalAggregator(Aggregator):
             with np.errstate(divide='ignore', invalid='ignore'):
                 mean_vec = sums[:, rid] / counts[:, rid]
             mean_vec[counts[:, rid] == 0] = np.nan
-            acc[rid][date] = mean_vec
+            acc[rid][date] = {'sum': sums[:, rid], 'count': counts[:, rid]}
+            # acc[rid][date] = mean_vec
 
     @staticmethod
     def finalize(acc: Dict[Any, np.ndarray]) -> Dict[Any, np.ndarray]:
-        return acc
+        return {rid: {date: (v['sum'] / v['count']) if v['count'] > 0 else np.nan for date, v in date_dict.items()} for rid, date_dict in acc.items()}
+        # return acc
 
 
 class RegionalIntegratedTemporalAggregator(RegionalTemporalAggregator):
@@ -236,6 +250,16 @@ class AverageAggregator(SpatialAggregator):
     """
     Computes the mean of all accumulated fields, ignoring NaNs.
     """
+    def init_accumulator(self, shape: Tuple[int, ...]) -> Dict[str, np.ndarray]:
+        return {
+            'sum': np.zeros(1, dtype=float),
+            'count': np.zeros(1, dtype=int)
+        }
+    def accumulate(self, acc: Dict[str, np.ndarray], field: np.ndarray, date: Any) -> None:
+        # Sum and count non-nan values
+        sum_axis = tuple(range(0, field.ndim-2))
+        acc['sum'] += np.nan_to_num(field, nan=0.0).sum()
+        acc['count'] += (~np.isnan(field)).astype(int).sum()
 
     @staticmethod
     def finalize(acc: Dict[str, np.ndarray]) -> np.ndarray:
@@ -445,4 +469,307 @@ class RawFieldAggregator(Aggregator):
     @staticmethod
     def finalize(acc: Dict[Any, np.ndarray]) -> Dict[Any, np.ndarray]:
         return acc
+    
 
+class BinnedByConditionAggregator(Aggregator):
+    """
+    Агрегирует field по бинам condition_dataset[date].
+
+    Например:
+      field = MAE(model, obs)
+      condition = cloud_fraction[date]
+
+    На выходе:
+      mean error as a function of cloud fraction
+    """
+
+    def __init__(self, condition_dataset, bins, right: bool = False, space_arity: int = 2):
+        super().__init__(space_arity=space_arity)
+        self.condition_dataset = condition_dataset
+        self.bins = np.asarray(bins, dtype=float)
+        self.right = right
+
+        if self.bins.ndim != 1 or len(self.bins) < 2:
+            raise ValueError("bins must be a 1D array with at least 2 edges")
+
+    def init_accumulator(self, shape: Tuple[int, ...]) -> Dict[str, np.ndarray]:
+        nbins = len(self.bins) - 1
+        return {
+            "sum": np.zeros(nbins, dtype=float),
+            "sum_sq": np.zeros(nbins, dtype=float),
+            "count": np.zeros(nbins, dtype=int),
+        }
+
+    def accumulate(self, acc: Dict[str, np.ndarray], field: np.ndarray, date: Any) -> None:
+        try:
+            cond = self.condition_dataset[date]
+        except Exception:
+            return
+
+        if cond is None or field is None:
+            return
+
+        field = np.asarray(field, dtype=float)
+        cond = np.asarray(cond, dtype=float)
+
+        value = field.ravel()
+        cond_val = cond.ravel()
+
+        if value.shape != cond_val.shape:
+            raise ValueError(
+                f"Shape mismatch in BinnedByConditionAggregator for date={date}: "
+                f"field.shape={field.shape}, cond.shape={cond.shape}"
+            )
+
+        valid = np.isfinite(value) & np.isfinite(cond_val)
+        if not np.any(valid):
+            return
+
+        value = value[valid]
+        cond_val = cond_val[valid]
+
+        idx = np.digitize(cond_val, self.bins, right=self.right) - 1
+        good = (idx >= 0) & (idx < len(self.bins) - 1)
+
+        if not np.any(good):
+            return
+
+        value = value[good]
+        idx = idx[good]
+
+        np.add.at(acc["sum"], idx, value)
+        np.add.at(acc["sum_sq"], idx, value**2)
+        np.add.at(acc["count"], idx, 1)
+
+    @staticmethod
+    def finalize(acc: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        mean = np.full_like(acc["sum"], np.nan, dtype=float)
+        std = np.full_like(acc["sum"], np.nan, dtype=float)
+
+        mask = acc["count"] > 0
+        mean[mask] = acc["sum"][mask] / acc["count"][mask]
+
+        var = np.full_like(acc["sum"], np.nan, dtype=float)
+        var[mask] = acc["sum_sq"][mask] / acc["count"][mask] - mean[mask]**2
+        var[mask] = np.maximum(var[mask], 0.0)
+        std[mask] = np.sqrt(var[mask])
+
+        return {
+            "mean": mean,
+            "std": std,
+            "count": acc["count"].copy(),
+        }
+    
+
+class BinnedByConditionPerDateAggregator(BinnedByConditionAggregator):
+    """
+    То же самое, что BinnedByConditionAggregator, но считает статистику
+    отдельно для каждой даты.
+
+    Результат finalize:
+    {
+        "bins": ...,
+        "by_date": {
+            date1: {"mean": ..., "std": ..., "count": ...},
+            date2: {"mean": ..., "std": ..., "count": ...},
+            ...
+        }
+    }
+    """
+
+    def init_accumulator(self, shape: Tuple[int, ...]) -> Dict[str, Any]:
+        return {
+            "bins": self.bins.copy(),
+            "by_date": {}
+        }
+
+    def accumulate(self, acc: Dict[str, Any], field: np.ndarray, date: Any) -> None:
+        if date not in acc["by_date"]:
+            acc["by_date"][date] = super().init_accumulator(field.shape)
+
+        super().accumulate(acc["by_date"][date], field, date)
+
+    @staticmethod
+    def finalize(acc: Dict[str, Any]) -> Dict[str, Any]:
+        by_date_final = {}
+        for date, date_acc in acc["by_date"].items():
+            by_date_final[date] = BinnedByConditionAggregator.finalize(date_acc)
+
+        return {
+            "bins": acc["bins"].copy(),
+            "by_date": by_date_final,
+        }
+    
+
+def get_field_meta(field, key=None, default=None):
+    meta = getattr(field, "meta", None)
+    if meta is None:
+        return default if key is not None else {}
+    if key is None:
+        return meta
+    return meta.get(key, default)
+
+
+class MetricField(np.ndarray):
+    """
+    ndarray + metadata
+    """
+    def __new__(cls, input_array, **meta):
+        obj = np.asarray(input_array).view(cls)
+        obj.meta = dict(meta)
+        return obj
+
+    def __array_finalize__(self, obj):
+        if obj is None:
+            return
+        self.meta = getattr(obj, "meta", {})
+
+    def __reduce__(self):
+        """Keep metadata alongside NumPy's array state when saving results."""
+        reconstruct, args, state = super().__reduce__()
+        return reconstruct, args, state + (getattr(self, "meta", {}),)
+
+    def __setstate__(self, state):
+        # Older result files contain only NumPy's ordinary ndarray state.
+        self.meta = state[-1] if len(state) == 6 else {}
+        array_state = state[:-1] if len(state) == 6 else state
+        super().__setstate__(array_state)
+
+
+class NestedLeadTimeAggregator(Aggregator):
+    """
+    Split field by lead_time from field.meta[lead_key] and delegate each subset
+    to nested aggregators.
+
+    Example
+    -------
+    field.shape = (T, R, C, H, W)
+    field.meta["lead_h"].shape = (T, R)
+
+    For each unique lead value L:
+        mask = (lead_h == L)
+        sub_field = field[mask]   # shape (N_selected, C, H, W)
+
+    Then each nested aggregator receives sub_field.
+
+    Result structure:
+        {
+            lead_1: {
+                "SpatialAggregator": ...,
+                "AverageAggregator": ...,
+            },
+            lead_2: {
+                ...
+            }
+        }
+
+    Notes
+    -----
+    1. This aggregator collapses all lead-indexed prefix axes selected by mask
+       into one leading batch axis via boolean indexing.
+    2. Nested aggregators must tolerate an additional leading batch dimension.
+       Most of your current aggregators do.
+    """
+
+    def __init__(
+        self,
+        aggregators: Iterable,
+        lead_key: str = "lead_h",
+        mask_key: str = "avail_mask",
+        ignore_negative_leads: bool = True,
+    ):
+        normalized = []
+        for i, item in enumerate(aggregators):
+            if isinstance(item, tuple):
+                name, agg = item
+            else:
+                agg = item
+                name = f"{agg.__class__.__name__}__{i}"
+            normalized.append((name, agg))
+
+        self.nested_aggregators: List[Tuple[str, Aggregator]] = normalized
+        self.lead_key = lead_key
+        self.mask_key = mask_key
+        self.ignore_negative_leads = ignore_negative_leads
+
+    def init_accumulator(self, shape: Tuple[int, ...]) -> Dict[str, Any]:
+        return {
+            "by_lead": {}
+        }
+
+    def _make_subfield(self, field: np.ndarray, mask: np.ndarray, lead_value: int):
+        arr = np.asarray(field)
+        sub_arr = arr[mask]  # -> (N_selected, *suffix)
+
+        # Try to preserve relevant metadata in filtered form
+        meta = {}
+        src_meta = get_field_meta(field, None, {})
+
+        # lead_h is now constant on selected subset
+        meta[self.lead_key] = np.full((sub_arr.shape[0],), int(lead_value), dtype=np.int32)
+
+        # carry selected avail_mask if needed (now always True for selected entries)
+        if self.mask_key in src_meta:
+            meta[self.mask_key] = np.ones((sub_arr.shape[0],), dtype=bool)
+
+        return MetricField(sub_arr, **meta)
+
+    def accumulate(self, acc: Dict[str, Any], field: np.ndarray, date: Any) -> None:
+        lead_h = get_field_meta(field, self.lead_key, None)
+        if lead_h is None:
+            lead_h = 0
+            # raise ValueError(
+            #     f"{self.__class__.__name__} requires field.meta['{self.lead_key}']"
+            # )
+
+        lead_h = np.asarray(lead_h)
+        arr = np.asarray(field)
+
+        if arr.shape[:lead_h.ndim] != lead_h.shape:
+            raise ValueError(
+                f"{self.__class__.__name__}: lead_h shape {lead_h.shape} must match "
+                f"prefix of field.shape {arr.shape}"
+            )
+
+        avail_mask = get_field_meta(field, self.mask_key, None)
+        if avail_mask is not None:
+            avail_mask = np.asarray(avail_mask, dtype=bool)
+            if avail_mask.shape != lead_h.shape:
+                raise ValueError(
+                    f"{self.__class__.__name__}: avail_mask shape {avail_mask.shape} "
+                    f"must match lead_h shape {lead_h.shape}"
+                )
+
+        unique_leads = np.unique(lead_h)
+        if self.ignore_negative_leads:
+            unique_leads = unique_leads[unique_leads >= 0]
+
+        for lead in unique_leads:
+            mask = (lead_h == lead)
+            if avail_mask is not None:
+                mask = mask & avail_mask
+
+            if not np.any(mask):
+                continue
+
+            sub_field = self._make_subfield(field, mask, int(lead))
+
+            lead_key = int(lead)
+            if lead_key not in acc["by_lead"]:
+                acc["by_lead"][lead_key] = {}
+
+            lead_bucket = acc["by_lead"][lead_key]
+
+            for agg_name, agg in self.nested_aggregators:
+                if agg_name not in lead_bucket:
+                    lead_bucket[agg_name] = agg.init_accumulator(sub_field.shape)
+                agg.accumulate(lead_bucket[agg_name], sub_field, date)
+
+    def finalize(self, acc: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+        result = {}
+        for lead in sorted(acc["by_lead"].keys()):
+            result[lead] = {}
+            for agg_name, agg in self.nested_aggregators:
+                if agg_name in acc["by_lead"][lead]:
+                    result[lead][agg_name] = agg.finalize(acc["by_lead"][lead][agg_name])
+        return result
