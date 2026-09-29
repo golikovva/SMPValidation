@@ -8,6 +8,7 @@ from libs.validation import Grid
 from libs.validation.datasets.base import (
     Dataset,
     ModelCurrentVelocityDataset,
+    ModelCurrentDataset,
     ModelDriftDataset,
     ModelEastCurrentDataset,
     ModelNorthCurrentDataset,
@@ -53,7 +54,7 @@ class GlorysOperativeDataset(GlorysDataset):
     """
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Returns the file template for operative datasets.
         """
@@ -122,7 +123,7 @@ class GlorysReanalysisDataset(GlorysDataset):
         return item
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Returns the file template for reanalysis datasets.
         """
@@ -276,6 +277,26 @@ class GlorysCurrentVelocityDataset(ModelCurrentVelocityDataset):
         return 'vo'
 
 
+class GlorysCurrentDataset(ModelCurrentDataset):
+    """
+    Dataset class for GLORYS current velocity data (combining eastward and northward currents).
+    """
+
+    @property
+    def _east_cur_variable(self):
+        """
+        Specifies the eastward current variable.
+        """
+        return 'uo'
+
+    @property
+    def _north_cur_variable(self):
+        """
+        Specifies the northward current variable.
+        """
+        return 'vo'
+
+
 class GlorysOperativeSicDataset(GlorysOperativeDataset, GlorysSicDataset):
     """
     Operative GLORYS sea ice concentration dataset.
@@ -324,7 +345,7 @@ class GlorysOperativeSalinityDataset(GlorysOperativeDataset, GlorysSalinityDatas
     """
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Returns the file template for operative salinity datasets.
         """
@@ -344,7 +365,7 @@ class GlorysOperativeTemperatureDataset(GlorysOperativeDataset, GlorysTemperatur
     """
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Returns the file template for operative temperature datasets.
         """
@@ -364,7 +385,7 @@ class GlorysOperativeEastCurrentDataset(GlorysOperativeDataset, GlorysEastCurren
     """
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Returns the file template for operative eastward current datasets.
         """
@@ -384,7 +405,7 @@ class GlorysOperativeNorthCurrentDataset(GlorysOperativeDataset, GlorysNorthCurr
     """
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Returns the file template for operative northward current datasets.
         """
@@ -397,6 +418,17 @@ class GlorysReanalysisNorthCurrentDataset(GlorysReanalysisDataset, GlorysNorthCu
     """
     pass
 
+class GlorysOperativeCurrentDataset(GlorysOperativeDataset, GlorysCurrentDataset):
+    """
+    Operative GLORYS current velocity dataset (combining eastward and northward currents).
+    """
+
+    @property
+    def _default_files_template(self) -> str:
+        """
+        Returns the file template for operative current velocity datasets.
+        """
+        return 'glorys_*/GLORYS_*_00_cmems_mod_glo_phy-cur_anfc_0.083deg_P1D-m.nc'
 
 class GlorysOperativeCurrentVelocityDataset(GlorysOperativeDataset, GlorysCurrentVelocityDataset):
     """
@@ -404,7 +436,7 @@ class GlorysOperativeCurrentVelocityDataset(GlorysOperativeDataset, GlorysCurren
     """
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Returns the file template for operative current velocity datasets.
         """
@@ -423,7 +455,10 @@ class GlorysOperativeCorrectedSalinityDataset(GlorysOperativeSalinityDataset):
     Operative GLORYS salinity dataset with a correction model applied.
     """
 
-    def __init__(self, path, dst_grid, average_times, name, correction_model):
+    def __init__(
+        self, path, dst_grid, average_times, name, correction_model,
+        *, files_template=None, interpolation_cache_dir=None,
+    ):
         """
         Initializes the dataset with an additional correction model.
 
@@ -433,8 +468,13 @@ class GlorysOperativeCorrectedSalinityDataset(GlorysOperativeSalinityDataset):
             average_times (list): Times to average over.
             name (str): Name of the dataset.
             correction_model (callable): The correction model to apply to the data.
+            interpolation_cache_dir (str or Path, optional): Directory for reusable
+                interpolation weights. None disables the disk cache.
         """
-        super().__init__(path, dst_grid, average_times, name)
+        super().__init__(
+            path, dst_grid, average_times, name, files_template=files_template,
+            interpolation_cache_dir=interpolation_cache_dir,
+        )
         self.correction_model = correction_model  # Store the correction model
 
     def _extract_data(self, file, load_fn=xr.open_dataset):

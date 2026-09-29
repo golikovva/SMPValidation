@@ -10,9 +10,9 @@ from libs.validation.datasets.base import (
 
 
 class GFSDataset(Dataset):
-    def __init__(self, path, variables, dst_grid=None, average_times=None, name=None):
+    def __init__(self, path, variables, dst_grid=None, average_times=None, name=None, *, files_template=None):
         self.variables = variables
-        super().__init__(path, dst_grid, average_times, name)
+        super().__init__(path, dst_grid, average_times, name, files_template=files_template)
 
     def _create_grid(self):
         """
@@ -91,7 +91,7 @@ class GFSDataset(Dataset):
         return date
     
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Returns the file template pattern for locating NEMO model dataset files.
 
