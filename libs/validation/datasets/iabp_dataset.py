@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -269,18 +270,19 @@ class BuoyBatch:
 
 class BuoyLocationsDataset:
     """
-    Dataset returning per-buoy windows of length T.
+    Dataset returning per-time batches of buoy windows of length T.
 
-    __getitem__ returns:
-        { buoy_id: BuoyWindow(coords=(T,2), datetimes=(T,), variables={...}) }
+    __getitem__ returns BuoyBatch with:
+        bids:      (N,)
+        coords:    (N, T, 2) float32
+        datetimes: (T,) datetime64[ns]
+        variables: (N, T, V) float32
 
-    If prepare=False (default), files are assumed to ALREADY contain:
-        - datetime column
-        - requested variables columns (if any)
-
-    If prepare=True, raw IABP columns are accepted and we will:
-        - interpolate/reindex to integer hours (nearest)
-        - optionally compute drift u/v (+ optional speed) IF requested
+    If average_times is not None:
+        we take the selected time indices and return the time-averaged sample:
+            coords    -> (N, 1, 2)
+            variables -> (N, 1, V)
+            datetimes -> (1,) (mean timestamp of selected indices)
     """
 
     def __init__(
@@ -290,8 +292,8 @@ class BuoyLocationsDataset:
         *,
         pattern: str = "*.csv",
         variables: Optional[Sequence[str]] = ("u_cm_s", "v_cm_s"),
-        prepare: bool = False,                    # default: assume already prepared
-        compute_drift_if_needed: bool = True,     # only used when prepare=True
+        prepare: bool = False,
+        compute_drift_if_needed: bool = True,
         datetime_col: str = "datetime",
         time_source: Literal["POS_DOY", "DOY"] = "POS_DOY",
         tolerance: Optional[str] = "45min",
@@ -302,13 +304,26 @@ class BuoyLocationsDataset:
         lon_col: str = "Lon",
         reader_kwargs: Optional[dict] = None,
         require_integer_hour_index: bool = True,
+        average_times: Optional[Union[slice, Sequence[int], np.ndarray]] = None,
+        name='buoy_locations',
+        fast_mode: bool = False,
+        fast_mode_attribute: Optional[str] = 'variables',
     ) -> None:
+        self.name = name
+        self.fast_mode = fast_mode
+        self.fast_mode_attribute = fast_mode_attribute
         self.folder = Path(folder)
         self.T = int(T)
         if self.T <= 0:
             raise ValueError("T must be a positive integer.")
 
         self.variables = tuple(variables) if variables is not None else tuple()
+        self.lat_col = lat_col
+        self.lon_col = lon_col
+
+        # --- average_times normalization (like your NC dataset) ---
+        self.average_times = self._normalize_average_times(average_times, self.T)
+        self.T_out = 1 if (self.average_times is not None) else self.T
 
         self._tracks: Dict[str, BuoyTrack] = {}
         self._times: List[pd.Timestamp] = []
@@ -323,10 +338,8 @@ class BuoyLocationsDataset:
             suf = path.suffix.lower()
             if suf == ".parquet":
                 return pd.read_parquet(path)
-            # csv vs whitespace
             if suf == ".csv":
                 kw = dict(reader_kwargs)
-                # allow user's sep override, otherwise comma
                 kw.setdefault("sep", ",")
                 return pd.read_csv(path, **kw)
             else:
@@ -343,7 +356,6 @@ class BuoyLocationsDataset:
 
             # Some files can contain multiple buoy IDs; support grouping anyway
             if prepare:
-                # Need raw time columns
                 for c in (id_col, year_col, time_source, lat_col, lon_col):
                     if c not in df_raw.columns:
                         raise ValueError(f"{fname.name}: missing column {c!r} required for prepare=True")
@@ -364,7 +376,6 @@ class BuoyLocationsDataset:
                         f"{fname.name}: expected {datetime_col!r} after interpolation (add_datetime_col=True)."
                     )
 
-                # Compute drift only if requested and enabled
                 if compute_drift_if_needed and self.variables:
                     drift_names = {"u_cm_s", "v_cm_s", "speed_cm_s"}
                     drift_needed = any(v in drift_names for v in self.variables)
@@ -400,14 +411,11 @@ class BuoyLocationsDataset:
                 g = g.copy()
                 g = g.dropna(subset=[datetime_col]).sort_values(datetime_col).set_index(datetime_col)
 
-                # Ensure unique timestamps
                 if not g.index.is_unique:
                     g = g[~g.index.duplicated(keep="last")]
 
                 if require_integer_hour_index and (g.index.minute != 0).any():
-                    raise ValueError(
-                        f"{fname.name} buoy {buoy_id}: non-integer-hour timestamps present."
-                    )
+                    raise ValueError(f"{fname.name} buoy {buoy_id}: non-integer-hour timestamps present.")
 
                 required_cols = [lat_col, lon_col] + list(self.variables)
                 missing = [c for c in required_cols if c not in g.columns]
@@ -435,8 +443,41 @@ class BuoyLocationsDataset:
                 "Try increasing tolerance, reducing T, or check files coverage."
             )
 
-        self.lat_col = lat_col
-        self.lon_col = lon_col
+    @staticmethod
+    def _normalize_average_times(
+        average_times: Optional[Union[slice, Sequence[int], np.ndarray]],
+        T: int,
+    ) -> Optional[Union[slice, np.ndarray]]:
+        if average_times is None:
+            return None
+
+        if isinstance(average_times, slice):
+            idx = list(range(*average_times.indices(T)))
+            if len(idx) == 0:
+                raise ValueError("average_times slice selects no elements.")
+            return average_times
+
+        idx = np.asarray(list(average_times), dtype=int)
+        if idx.size == 0:
+            raise ValueError("average_times must select at least one time index.")
+
+        # allow negative indices like numpy
+        idx_pos = np.where(idx < 0, idx + T, idx)
+        if (idx_pos < 0).any() or (idx_pos >= T).any():
+            raise IndexError(f"average_times indices out of range for T={T}: {idx.tolist()}")
+        return idx  # keep original numpy-style (negatives ok)
+
+    @staticmethod
+    def _mean_datetime64(dt: np.ndarray) -> np.datetime64:
+        """
+        Mean of datetime64[ns] array -> datetime64[ns].
+        Works by averaging int64 nanoseconds.
+        """
+        dt = np.asarray(dt)
+        if dt.size == 0:
+            raise ValueError("Cannot average an empty datetime array.")
+        ns = dt.astype("datetime64[ns]").astype("int64")
+        return np.datetime64(int(np.round(ns.mean())), "ns")
 
     @property
     def buoy_ids(self) -> List[str]:
@@ -476,36 +517,60 @@ class BuoyLocationsDataset:
             if len(block) != self.T:
                 continue
 
-            coords = block[[self.lat_col, self.lon_col]].to_numpy(dtype=np.float32)
+            coords = block[[self.lat_col, self.lon_col]].to_numpy(dtype=np.float32)  # (T,2)
             if np.isnan(coords).any():
                 continue
 
             if V > 0:
-                vv = block[list(var_names)].to_numpy(dtype=np.float32)  # (T, V)
+                vv = block[list(var_names)].to_numpy(dtype=np.float32)  # (T,V)
                 if np.isnan(vv).any():
                     continue
             else:
                 vv = np.empty((self.T, 0), dtype=np.float32)
 
             if dt_arr is None:
-                dt_arr = block.index.to_numpy(dtype="datetime64[ns]")
+                dt_arr = block.index.to_numpy(dtype="datetime64[ns]")  # (T,)
 
             bids.append(str(bid))
             coords_list.append(coords)
             vars_list.append(vv)
 
         if not bids:
-            # Choose behavior: return empty batch (often easier for training loops)
-            return BuoyBatch.empty(self.T, var_names)
+            return None
+            # return BuoyBatch.empty(self.T_out, var_names)
 
-        bids_arr = np.asarray(bids, dtype=object)
-        coords_arr = np.stack(coords_list, axis=1)          # (T, N, 2)
-        vars_arr = np.stack(vars_list, axis=-1)              # (T, V, N)
+        # --- FIXED stacking: produce (N,T,...) as BuoyBatch expects ---
+        bids_arr = np.asarray(bids, dtype=object)                   # (N,)
+        coords_arr = np.stack(coords_list, axis=-2)                  # (T,N,2)
+        vars_arr = np.stack(vars_list, axis=-1)                      # (T,V,N)
+        dt_arr = dt_arr if dt_arr is not None else np.empty((self.T,), dtype="datetime64[ns]")
 
-        return BuoyBatch(
+        # --- average_times behavior (like your NC dataset) ---
+        if self.average_times is not None:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                vars_sel = vars_arr[self.average_times]        # (K,V,N)                
+                vars_mean = np.nanmean(vars_sel, axis=0, keepdims=True).astype(np.float32)     # (1,V,N)
+
+            if isinstance(self.average_times, slice):
+                idxs = np.arange(self.T)[self.average_times]
+            else:
+                idxs = self.average_times
+
+            mid = int(idxs[len(idxs)//2])          # центральный индекс
+            coords_arr = coords_arr[mid:mid+1]  # (1,2,N)
+            dt_arr = dt_arr[mid:mid+1] 
+            vars_arr = vars_mean
+        
+        out = BuoyBatch(
             bids=bids_arr,
             coords=coords_arr,
-            datetimes=dt_arr if dt_arr is not None else np.empty((self.T,), dtype="datetime64[ns]"),
+            datetimes=dt_arr,
             variables=vars_arr,
             var_names=var_names,
         )
+
+        if self.fast_mode:
+            return getattr(out, self.fast_mode_attribute)
+
+        return out
