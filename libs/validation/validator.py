@@ -185,6 +185,17 @@ class MetricField(np.ndarray):
             return
         self.meta = getattr(obj, "meta", {})
 
+    def __reduce__(self):
+        """Keep metadata alongside NumPy's array state when saving results."""
+        reconstruct, args, state = super().__reduce__()
+        return reconstruct, args, state + (getattr(self, "meta", {}),)
+
+    def __setstate__(self, state):
+        # Older result files contain only NumPy's ordinary ndarray state.
+        self.meta = state[-1] if len(state) == 6 else {}
+        array_state = state[:-1] if len(state) == 6 else state
+        super().__setstate__(array_state)
+
     def get_meta(self, key=None, default=None):
         if key is None:
             return self.meta
