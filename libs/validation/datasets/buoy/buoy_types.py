@@ -17,8 +17,15 @@ class VariableSpec:
 
 
 SCALAR_VARIABLES = {
-    name: VariableSpec(name)
-    for name in ("ice_thickness", "snow_thickness")
+    "ice_thickness": VariableSpec("ice_thickness"),
+    "snow_thickness": VariableSpec("snow_thickness"),
+    "sst": VariableSpec("sst", units="degC"),
+    "sss": VariableSpec("sss", units="psu"),
+}
+
+DRIFT_VARIABLES = {
+    name: VariableSpec(name, units="cm/s")
+    for name in ("drift_speed", "drift_eastward", "drift_northward")
 }
 
 
@@ -50,6 +57,16 @@ class PositionSeries:
         object.__setattr__(self, "coords", coords)
 
 
+def _measurement_depths(depths, values, dtype):
+    """Normalize optional measurement depths (metres, positive down)."""
+    result = (np.full(values.shape, np.nan, dtype=dtype) if depths is None
+              else np.array(depths, dtype=dtype, copy=True))
+    if result.shape != values.shape:
+        raise ValueError(f"depths must have shape {values.shape}, got {result.shape}.")
+    result[~np.isfinite(result) | ~np.isfinite(values)] = np.nan
+    return result
+
+
 @dataclass(frozen=True)
 class ScalarSeries:
     """One physical variable on its own native clock; unknown uncertainty is NaN."""
@@ -57,6 +74,7 @@ class ScalarSeries:
     datetimes: np.ndarray
     values: np.ndarray
     uncertainty: np.ndarray | None = None
+    depths: np.ndarray | None = None
 
     def __post_init__(self):
         times = np.asarray(self.datetimes, dtype="datetime64[ns]")
@@ -71,6 +89,7 @@ class ScalarSeries:
         object.__setattr__(self, "datetimes", times)
         object.__setattr__(self, "values", values)
         object.__setattr__(self, "uncertainty", uncertainty)
+        object.__setattr__(self, "depths", _measurement_depths(self.depths, values, np.float64))
 
 
 @dataclass(frozen=True)
@@ -97,6 +116,44 @@ class BuoySource(Protocol):
 
 
 @dataclass(frozen=True)
+class DriftSupport:
+    """Actual segment endpoints, with leading (N, T) or window (T,) axes."""
+
+    coords: np.ndarray
+    datetimes: np.ndarray
+    valid: np.ndarray
+
+    def __post_init__(self):
+        coords = np.asarray(self.coords, dtype=np.float64)
+        times = np.asarray(self.datetimes, dtype="datetime64[ns]")
+        valid = np.asarray(self.valid, dtype=bool)
+        if valid.ndim not in (1, 2):
+            raise ValueError("DriftSupport valid must have shape (N, T) or (T,).")
+        if coords.shape != valid.shape + (2, 2) or times.shape != valid.shape + (2,):
+            raise ValueError("DriftSupport requires two endpoint times and [lat, lon] pairs per segment.")
+        if not np.array_equal(valid, np.isfinite(coords).all(axis=(-2, -1))):
+            raise ValueError("DriftSupport valid must match finite endpoint pairs.")
+        if not np.array_equal(valid, (~np.isnat(times)).all(axis=-1)):
+            raise ValueError("DriftSupport valid must match both endpoint times.")
+        if not np.isnan(coords[~valid]).all() or not np.isnat(times[~valid]).all():
+            raise ValueError("Missing drift segments require all-NaN coordinates and all-NaT times.")
+        if np.any(times[..., 1][valid] <= times[..., 0][valid]):
+            raise ValueError("DriftSupport endpoint times must have positive duration.")
+        object.__setattr__(self, "coords", coords)
+        object.__setattr__(self, "datetimes", times)
+        object.__setattr__(self, "valid", valid)
+
+    @classmethod
+    def empty(cls, shape) -> DriftSupport:
+        shape = tuple(shape)
+        return cls(
+            np.full(shape + (2, 2), np.nan, dtype=np.float64),
+            np.full(shape + (2,), np.datetime64("NaT", "ns")),
+            np.zeros(shape, dtype=bool),
+        )
+
+
+@dataclass(frozen=True)
 class BuoyWindow:
     bid: str
     coords: np.ndarray
@@ -110,6 +167,14 @@ class BuoyWindow:
     value_times: np.ndarray
     uncertainty: np.ndarray
     metadata: Mapping[str, Any]
+    drift_support: DriftSupport | None = None
+    depths: np.ndarray | None = None
+
+    def __post_init__(self):
+        values = np.asarray(self.variables)
+        if values.shape != (len(self.datetimes), len(self.var_names)):
+            raise ValueError("BuoyWindow variables must have shape (T, V).")
+        object.__setattr__(self, "depths", _measurement_depths(self.depths, values, np.float32))
 
     def var(self, name: str) -> np.ndarray:
         try:
@@ -138,6 +203,8 @@ class BuoyBatch:
     value_times: np.ndarray
     uncertainty: np.ndarray
     metadata: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    drift_support: DriftSupport | None = None
+    depths: np.ndarray | None = None
     _bid_to_i: dict[str, int] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
@@ -167,6 +234,7 @@ class BuoyBatch:
         for name, shape in shapes.items():
             if getattr(self, name).shape != shape:
                 raise ValueError(f"{name} must have shape {shape}, got {getattr(self, name).shape}.")
+        object.__setattr__(self, "depths", _measurement_depths(self.depths, self.variables, np.float32))
         if np.isnat(self.datetimes).any() or (
             t > 1 and np.any(self.datetimes[1:] <= self.datetimes[:-1])
         ):
@@ -179,6 +247,21 @@ class BuoyBatch:
             raise ValueError("value_times must be NaT exactly where measurements are missing.")
         if not np.array_equal(self.coord_valid, ~np.isnat(self.coord_times)):
             raise ValueError("coord_times must be NaT exactly where positions are missing.")
+        drift_indices = [j for j, name in enumerate(self.var_names) if name in DRIFT_VARIABLES]
+        if drift_indices:
+            support = self.drift_support
+            if support is None or support.valid.shape != (n, t):
+                raise ValueError("Drift variables require drift_support with leading shape (N, T).")
+            for j in drift_indices:
+                if not np.array_equal(self.valid[..., j], support.valid):
+                    raise ValueError("All drift variables must use the same valid segment.")
+                if not np.array_equal(
+                    self.value_times[..., j][support.valid],
+                    support.datetimes[..., 0][support.valid],
+                ):
+                    raise ValueError("Drift value_times must equal the segment start times.")
+        elif self.drift_support is not None:
+            raise ValueError("drift_support requires at least one drift variable.")
         object.__setattr__(self, "_bid_to_i", {bid: i for i, bid in enumerate(self.bids)})
 
     def __len__(self) -> int:
@@ -203,6 +286,11 @@ class BuoyBatch:
             coord_valid=self.coord_valid[i], valid=self.valid[i],
             coord_times=self.coord_times[i], value_times=self.value_times[i],
             uncertainty=self.uncertainty[i], metadata=self.metadata.get(bid, {}),
+            depths=self.depths[i],
+            drift_support=(None if self.drift_support is None else DriftSupport(
+                self.drift_support.coords[i], self.drift_support.datetimes[i],
+                self.drift_support.valid[i],
+            )),
         )
 
     def var(self, name: str) -> np.ndarray:
@@ -223,4 +311,6 @@ class BuoyBatch:
             coord_times=np.empty((0, t), dtype="datetime64[ns]"),
             value_times=np.empty((0, t, v), dtype="datetime64[ns]"),
             uncertainty=np.empty((0, t, v), np.float32),
+            drift_support=(DriftSupport.empty((0, t))
+                           if any(name in DRIFT_VARIABLES for name in var_names) else None),
         )

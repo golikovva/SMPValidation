@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from copy import deepcopy
-from dataclasses import replace
-from numbers import Number
+from dataclasses import dataclass, replace
+from numbers import Number, Real
 from typing import Sequence
 
 import numpy as np
 import pandas as pd
 
-from .buoy_types import NativeBuoyData, PositionSeries, ScalarSeries
+from .buoy_types import DriftSupport, NativeBuoyData, PositionSeries, ScalarSeries
 
 
 def normalize_datetimes(values, *, allow_empty=True, strict=False) -> np.ndarray:
@@ -94,18 +95,28 @@ def _merge_scalar(parts, name, diagnostics):
     times = normalize_datetimes(np.concatenate([p.datetimes for p in parts]))
     values = np.concatenate([p.values for p in parts]).astype(np.float64)
     uncertainty = np.concatenate([p.uncertainty for p in parts]).astype(np.float64)
+    depths = np.concatenate([p.depths for p in parts]).astype(np.float64)
     values[~np.isfinite(values)] = np.nan
     uncertainty[~np.isfinite(uncertainty) | ~np.isfinite(values)] = np.nan
+    depths[~np.isfinite(depths) | ~np.isfinite(values)] = np.nan
     order = np.argsort(times, kind="stable")
     times, values, uncertainty = times[order], values[order], uncertainty[order]
+    depths = depths[order]
     unique, first, counts = _duplicate_groups(times)
     out, error = values[first].copy(), uncertainty[first].copy()
+    out_depth = depths[first].copy()
     for i in np.flatnonzero(counts > 1):
         block = slice(first[i], first[i] + counts[i])
         vals = values[block]
         distinct = np.unique(vals[np.isfinite(vals)])
         if len(distinct) == 1:
             out[i] = distinct[0]
+            known_depths = np.unique(depths[block][np.isfinite(depths[block])])
+            out_depth[i] = known_depths[0] if len(known_depths) == 1 else np.nan
+            if len(known_depths) > 1:
+                out[i], error[i] = np.nan, np.nan
+                diagnostics.append({"kind": "conflicting_depths", "variable": name, "time": str(unique[i])})
+                continue
             errors = uncertainty[block][np.isfinite(vals)]
             errors = np.unique(errors[np.isfinite(errors)])
             error[i] = errors[0] if len(errors) == 1 else np.nan
@@ -114,10 +125,10 @@ def _merge_scalar(parts, name, diagnostics):
                     "kind": "conflicting_uncertainty", "variable": name, "time": str(unique[i]),
                 })
         else:
-            out[i], error[i] = np.nan, np.nan
+            out[i], error[i], out_depth[i] = np.nan, np.nan, np.nan
             if len(distinct) > 1:
                 diagnostics.append({"kind": "conflicting_values", "variable": name, "time": str(unique[i])})
-    return ScalarSeries(unique, out, error)
+    return ScalarSeries(unique, out, error, depths=out_depth)
 
 
 def merge_native_data(parts: Sequence[NativeBuoyData]) -> NativeBuoyData:
@@ -143,21 +154,28 @@ def merge_native_data(parts: Sequence[NativeBuoyData]) -> NativeBuoyData:
         name: _merge_scalar([p.series[name] for p in parts if name in p.series], name, diagnostics)
         for name in names
     }
-    # Preserve invalidation when merging a previously normalized result.
+    # Preserve invalidation when merging a previously normalized result. Apply
+    # groups in bulk: IABP can contain thousands of conflicts in a single track.
+    tombstones = {}
     for diagnostic in diagnostics:
         when = diagnostic.get("time")
-        if when is None:
-            continue
         kind = diagnostic.get("kind")
+        if when is not None and kind in (
+            "conflicting_coordinates", "conflicting_values", "conflicting_uncertainty", "conflicting_depths",
+        ):
+            tombstones.setdefault((kind, diagnostic.get("variable")), []).append(when)
+    for (kind, name), rejected in tombstones.items():
+        rejected_times = np.asarray(rejected, dtype="datetime64[ns]")
         if kind == "conflicting_coordinates":
-            positions.coords[positions.datetimes == np.datetime64(when, "ns")] = np.nan
-        elif kind in ("conflicting_values", "conflicting_uncertainty"):
-            scalar = series.get(diagnostic.get("variable"))
+            positions.coords[np.isin(positions.datetimes, rejected_times)] = np.nan
+        else:
+            scalar = series.get(name)
             if scalar is not None:
-                selected = scalar.datetimes == np.datetime64(when, "ns")
+                selected = np.isin(scalar.datetimes, rejected_times)
                 scalar.uncertainty[selected] = np.nan
-                if kind == "conflicting_values":
+                if kind in ("conflicting_values", "conflicting_depths"):
                     scalar.values[selected] = np.nan
+                    scalar.depths[selected] = np.nan
     # Deduplicate diagnostics produced by repeated normalization.
     unique_diagnostics = []
     seen = set()
@@ -172,6 +190,16 @@ def merge_native_data(parts: Sequence[NativeBuoyData]) -> NativeBuoyData:
         "source": descriptor.source, "source_buoy_id": descriptor.source_buoy_id,
         "files": tuple(str(f) for f in files), "diagnostics": unique_diagnostics,
     })
+    if any("row_counts" in part.metadata for part in parts):
+        row_counts = Counter()
+        for part in parts:
+            row_counts.update(part.metadata.get("row_counts", {}))
+        metadata["row_counts"] = dict(row_counts)
+    if any("diagnostic_counts" in part.metadata or "row_counts" in part.metadata for part in parts):
+        diagnostic_counts = Counter()
+        for diagnostic in unique_diagnostics:
+            diagnostic_counts[diagnostic["kind"]] += diagnostic.get("count", 1)
+        metadata["diagnostic_counts"] = dict(diagnostic_counts)
     file_metadata = {}
     for part in parts:
         file_metadata.update(part.descriptor.metadata.get("file_metadata", {}))
@@ -221,7 +249,10 @@ def slice_native_data(data: NativeBuoyData, start=None, stop=None) -> NativeBuoy
     series = {}
     for name, scalar in data.series.items():
         take = mask(scalar.datetimes)
-        series[name] = ScalarSeries(scalar.datetimes[take], scalar.values[take], scalar.uncertainty[take])
+        series[name] = ScalarSeries(
+            scalar.datetimes[take], scalar.values[take], scalar.uncertainty[take],
+            depths=scalar.depths[take],
+        )
     return NativeBuoyData(deepcopy(data.descriptor), positions, series, deepcopy(dict(data.metadata)))
 
 
@@ -256,3 +287,95 @@ def select_time_indices(source_times, query_times, *, method="exact", tolerance=
     good = distance <= np.uint64(tolerance.value)
     result[good] = chosen[good]
     return result
+
+
+@dataclass(frozen=True)
+class _NativeDrift:
+    """Native segment starts, including invalid anchors that preserve gaps."""
+
+    datetimes: np.ndarray
+    values: np.ndarray  # speed, eastward, northward, all in cm/s
+    support: DriftSupport
+    metadata: dict
+    rejected_speed_segments: tuple[dict, ...] = ()
+
+
+def validate_drift_max_speed(value) -> float | None:
+    """Validate an optional positive drift magnitude limit in cm/s."""
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise ValueError("drift_max_speed must be a positive finite number in cm/s or None.")
+    try:
+        limit = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("drift_max_speed must be a positive finite number in cm/s or None.") from exc
+    if not np.isfinite(limit) or limit <= 0:
+        raise ValueError("drift_max_speed must be a positive finite number in cm/s or None.")
+    return limit
+
+
+def derive_drift(positions: PositionSeries, max_gap, *, max_speed=100.0) -> _NativeDrift:
+    """Compute WGS84 drift in cm/s before resampling, preserving position breaks.
+
+    Positions must already be merged and sorted, including invalid records.
+    Magnitudes strictly above max_speed are rejected (None disables this check).
+    Rejected segment starts remain in the cache so nearest selection cannot
+    silently substitute a neighbouring usable segment.
+    """
+    # Keep the existing numerical kernel and its cm/s API unchanged. Lazy import
+    # also avoids adding pyproj to scalar-only source reading.
+    from ..iabp_utils import drift_uv_cm_s_from_latlon
+
+    gap = fixed_timedelta(max_gap, name="drift_max_gap")
+    limit = validate_drift_max_speed(max_speed)
+    times = positions.datetimes
+    coords = positions.coords
+    if np.isnat(times).any() or np.any(times[1:] <= times[:-1]):
+        raise ValueError("Drift requires sorted, unique, valid position times.")
+    # Unsigned subtraction is exact even across the full datetime64[ns] range.
+    ticks = times.view(np.int64).astype(np.uint64)
+    durations = ticks[1:] - ticks[:-1]
+    dt_seconds = durations.astype(np.float64) / 1e9
+    gap_ns = gap.value
+    good_coords = np.isfinite(coords).all(axis=1)
+    good_pairs = good_coords[:-1] & good_coords[1:]
+    within_gap = durations <= gap_ns
+    east, north, speed, distance = drift_uv_cm_s_from_latlon(
+        coords[:, 0], coords[:, 1], dt_seconds,
+        return_distance=True,
+    )
+    values = np.column_stack((speed[:-1], east[:-1], north[:-1]))
+    finite = np.isfinite(values).all(axis=1)
+    eligible = good_pairs & within_gap & finite
+    speed_exceeded = (eligible & (speed[:-1] > limit) if limit is not None
+                      else np.zeros(len(durations), dtype=bool))
+    usable = eligible & ~speed_exceeded
+    rows = np.flatnonzero(usable)
+    support = DriftSupport.empty((len(durations),))
+    support.coords[rows] = np.stack((coords[rows], coords[rows + 1]), axis=1)
+    support.datetimes[rows] = np.stack((times[rows], times[rows + 1]), axis=1)
+    support.valid[rows] = True
+    rejected = tuple({
+        "kind": "drift_speed_exceeded",
+        "t0": times[row], "t1": times[row + 1],
+        "coords0": tuple(coords[row]), "coords1": tuple(coords[row + 1]),
+        "dt_seconds": float(dt_seconds[row]),
+        "distance_m": float(distance[row]),
+        "speed_cm_s": float(speed[row]), "limit_cm_s": limit,
+    } for row in np.flatnonzero(speed_exceeded))
+    metadata = {
+        "method": "consecutive_native_positions",
+        "ellipsoid": "WGS84", "anchor": "start", "units": "cm/s",
+        "components": "local_east_north_at_start",
+        "drift_max_gap": str(gap), "drift_max_gap_ns": gap_ns,
+        "drift_max_speed_cm_s": limit,
+        "candidate_segments": len(durations), "valid_segments": len(rows),
+        "rejected_segments": int((~usable).sum()),
+        "invalid_position_segments": int((~good_pairs).sum()),
+        "gap_exceeded_segments": int((good_pairs & ~within_gap).sum()),
+        "nonfinite_velocity_segments": int((good_pairs & within_gap & ~finite).sum()),
+        "speed_exceeded_segments": int(speed_exceeded.sum()),
+    }
+    values[~usable] = np.nan
+    return _NativeDrift(times[:-1].copy(), values, support, metadata, rejected)
