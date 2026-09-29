@@ -5,15 +5,138 @@ import cartopy.crs as ccrs  # For cartographic projections in visualizations
 import cartopy.feature as cfeature  # For adding geographic features (land, oceans, etc.)
 import numpy as np  # For numerical computations
 from matplotlib import pyplot as plt  # For plotting
+import matplotlib as mpl
+import matplotlib.cm as cm
 import matplotlib.dates as mdates
+import matplotlib.ticker as mticker
 import matplotlib.colors as colors
 from matplotlib.gridspec import GridSpec
+from matplotlib.collections import LineCollection
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
+
+from collections.abc import Mapping
 
 import datetime
 from datetime import date
 from typing import Dict, Optional
 import calendar
 import warnings
+
+
+try:
+    from cartopy.mpl.geoaxes import GeoAxes
+except Exception:
+    GeoAxes = None
+
+
+def get_domain_projection(domain_name):
+    name = domain_name.lower()
+    if 'borey' in name:
+        return ccrs.LambertAzimuthalEqualArea(
+            central_longitude=80.0,
+            central_latitude=71.0
+        )
+    elif 'pan' in name or 'arctic' in name:
+        return ccrs.NorthPolarStereo(central_longitude=120.0)
+    elif 'smp' in name or 'nestp' in name:
+        return ccrs.NorthPolarStereo(central_longitude=120.0)
+    elif any(k in name for k in ['glorys', 'global', 'world']):
+        return ccrs.Robinson(central_longitude=120.0)
+    else:
+        return None
+
+def get_domain_extent(domain_name):
+    name = domain_name.lower()
+
+    if 'borey' in name:
+        return [-1850799.028266253, -169147.24810465102,
+                 -390064.97663009784, 881589.4853213852]
+    elif 'pan' in name or 'arctic' in name:
+        return None   # todo fill when ready
+    elif 'smp' in name or 'nestp' in name:
+        return [-3178711.951944511, 3178711.952368256,
+                -2252806.5461317636, 239082.4972454039]
+    elif any(k in name for k in ['glorys', 'global', 'world']):
+        return [-180, 180, -90, 90]
+    else:
+        return None
+
+def set_domain_extent(ax, domain, grid=None):
+    src = ccrs.PlateCarree()
+
+    if isinstance(domain, str):
+        domain_name = domain
+        domain_proj = get_domain_projection(domain_name)
+        if domain_proj is None:
+            raise ValueError(f'Unknown domain name: {domain_name}')
+    else:
+        domain_name = None
+        domain_proj = domain
+
+    if grid is None:
+        if domain_name is None:
+            raise ValueError(
+                "When grid is None, `domain` must be a string domain name "
+                "so that extent can be looked up."
+            )
+        extent_proj = get_domain_extent(domain_name)
+        if extent_proj is None:
+            raise ValueError(f'No predefined extent for domain: {domain_name}')
+    else:
+        lat2d, lon2d = lat_lon_from_grid(grid)
+
+        xy = domain_proj.transform_points(src, lon2d, lat2d)
+        x = xy[..., 0]
+        y = xy[..., 1]
+
+        mask = np.isfinite(x) & np.isfinite(y)
+        if not np.any(mask):
+            raise ValueError("No finite projected coordinates found for grid")
+
+        extent_proj = [
+            np.nanmin(x[mask]),
+            np.nanmax(x[mask]),
+            np.nanmin(y[mask]),
+            np.nanmax(y[mask]),
+        ]
+
+    ax.set_extent(extent_proj, crs=domain_proj)
+
+def lat_lon_from_grid(grid):
+    lat_names = ['lat', 'latitude', 'XLAT', 'Latitude']
+    lon_names = ['lon', 'long', 'longitude', 'XLON', 'XLONG', 'Longitude']
+
+    def _looks_like_array(x):
+        # Reject addict auto-created empties / dicts
+        if isinstance(x, Mapping):
+            return False
+        # Accept numpy arrays and array-like objects
+        return isinstance(x, np.ndarray) or hasattr(x, "shape")
+
+    def _get(obj, names):
+        # 1) Mapping path (safe for addict.Dict)
+        if isinstance(obj, Mapping):
+            for name in names:
+                if name in obj:              # does NOT create in addict
+                    val = obj[name]
+                    if _looks_like_array(val):
+                        return val
+
+        # 2) Attribute path (for non-mapping grid objects)
+        for name in names:
+            try:
+                val = getattr(obj, name)
+            except AttributeError:
+                continue
+            if _looks_like_array(val):
+                return val
+
+        return None
+
+    lat = _get(grid, lat_names)
+    lon = _get(grid, lon_names)
+    return lat, lon
 
 
 def fix_quiver_bug(field, lat):
@@ -39,7 +162,191 @@ def fix_quiver_bug(field, lat):
     field_fixed = np.stack([ufield_fixed, vfield]) * old_magnitude / new_magnitude.clip(min=1e-6)
     return field_fixed
 
-def create_cartopy(coastline_resolution='110m', figsize=(12, 12), fig=None, ax=None):
+
+def _outer_ring(lon, lat):
+    """Counter-clockwise outer ring of a 2D lon/lat grid."""
+    top    = np.c_[lon[0, :],          lat[0, :]]
+    right  = np.c_[lon[1:, -1],        lat[1:, -1]]
+    bottom = np.c_[lon[-1, -2::-1],    lat[-1, -2::-1]]
+    left   = np.c_[lon[-2:0:-1, 0],    lat[-2:0:-1, 0]]
+    return np.vstack([top, right, bottom, left])
+
+
+def _tight_projected_limits(lon, lat, target_crs, src_crs=ccrs.PlateCarree()):
+    """Compute tight (xmin,xmax,ymin,ymax) in target_crs for a lon/lat grid."""
+    ring = _outer_ring(lon, lat)
+    xy   = target_crs.transform_points(src_crs, ring[:, 0], ring[:, 1])
+    x, y = xy[:, 0], xy[:, 1]
+    return np.nanmin(x), np.nanmax(x), np.nanmin(y), np.nanmax(y)
+
+
+def iter_axes(x):
+    if x is None:
+        return
+    # leaf: Axes-like
+    if hasattr(x, "figure"):
+        yield x
+        return
+
+    if isinstance(x, np.ndarray):
+        for v in x.flat:
+            yield from iter_axes(v)
+        return
+
+    if isinstance(x, (list, tuple)):
+        for v in x:
+            yield from iter_axes(v)
+        return
+
+    raise TypeError(f"Unsupported ax container type: {type(x)!r}")
+
+
+def map_axes(x, fn):
+    """Recursively map axes container -> same structure with transformed axes."""
+    if x is None:
+        return None
+    if hasattr(x, "figure"):  # scalar axis
+        return fn(x)
+    if isinstance(x, np.ndarray):
+        out = np.empty_like(x, dtype=object)
+        for idx, v in np.ndenumerate(x):
+            out[idx] = map_axes(v, fn)
+        return out
+    if isinstance(x, list):
+        return [map_axes(v, fn) for v in x]
+    if isinstance(x, tuple):
+        return tuple(map_axes(v, fn) for v in x)
+    raise TypeError(f"Unsupported ax container type: {type(x)!r}")
+
+
+def create_cartopy_axes(
+    nrows: int = 1,
+    ncols: int = 1,
+    *,
+    coastline_resolution: str = '110m',
+    central_longitude: float = 120.0,
+    figsize=None,
+    ax_size: float = 6.0,
+    grid=None,
+    add_land: bool = True,
+    face_ocean: bool = True,
+    add_gridlines: bool = True,
+    add_coastlines: bool = True,
+    proj=None,
+    ax=None,  # NEW
+):
+    """
+    If ax is None: creates new (fig, axes).
+    If ax is provided: converts/replaces provided axes into Cartopy GeoAxes (if needed) and styles them.
+    Works with ax being a scalar, list/tuple (nested), or np.ndarray of any ndim.
+    """
+
+    if proj is None:
+        proj = ccrs.NorthPolarStereo(central_longitude=central_longitude)
+    if isinstance(proj, str):
+        proj = get_domain_projection(proj)
+    def _is_geoaxes(a):
+        if a is None:
+            return False
+        if GeoAxes is not None and isinstance(a, GeoAxes):
+            return True
+        # fallback: Cartopy GeoAxes has `.projection` (CRS), plain mpl Axes обычно нет
+        return hasattr(a, "projection")
+
+    def _ensure_geoaxes(fig, old_ax):
+        """Return GeoAxes. If old_ax is not GeoAxes -> replace it in-place (remove + add) preserving location."""
+        if old_ax is None:
+            return None
+        if _is_geoaxes(old_ax):
+            return old_ax
+
+        # same figure check
+        if old_ax.figure is not fig:
+            raise ValueError("All provided axes must belong to the same figure.")
+
+        # prefer SubplotSpec (keeps gridspec layout perfectly)
+        try:
+            ss = old_ax.get_subplotspec()
+        except Exception:
+            ss = None
+
+        if ss is not None:
+            old_ax.remove()
+            return fig.add_subplot(ss, projection=proj)
+
+        # fallback: absolute position
+        pos = old_ax.get_position()
+        old_ax.remove()
+        return fig.add_axes(pos, projection=proj)
+
+    def _style_geoax(a):
+        if a is None:
+            return a
+
+        if face_ocean:
+            a.set_facecolor(cfeature.COLORS["water"])
+
+        if add_land:
+            land = cfeature.NaturalEarthFeature(
+                "physical", "land", coastline_resolution,
+                edgecolor=None,
+                facecolor=cfeature.COLORS["land"],
+            )
+            a.add_feature(land, zorder=0)
+
+        if add_gridlines:
+            gl = a.gridlines(draw_labels=True, color="gray", alpha=0.5, linestyle="--")
+            # gl.ylocator = mticker.FixedLocator(np.arange(-85, 90, 10))
+            # позиционирование labels пока не трогаем
+        
+        if add_coastlines:
+            a.coastlines(resolution=coastline_resolution, linewidth=0.5, color='black', zorder=8)
+
+        return a
+
+    def _first_axis(x):
+        return next(iter_axes(x), None)
+
+    # 1) Create axes if not provided
+    if ax is None:
+        if figsize is None:
+            aspect = 1.0
+            if grid is not None and (nrows == 1 and ncols == 1):
+                # uses YOUR implementation; must exist in scope
+                lat, lon = lat_lon_from_grid(grid)
+                if lat is not None and lon is not None and "_tight_projected_limits" in globals():
+                    xmin, xmax, ymin, ymax = _tight_projected_limits(np.asarray(lon), np.asarray(lat), proj)
+                    if ymax > ymin:
+                        aspect = (xmax - xmin) / (ymax - ymin)
+
+            figsize = (ax_size * ncols * aspect, ax_size * nrows)
+
+        fig, axes = plt.subplots(
+            nrows=nrows, ncols=ncols, figsize=figsize,
+            subplot_kw={"projection": proj},
+            squeeze=False,
+        )
+        ax_in = axes[0, 0] if (nrows == 1 and ncols == 1) else axes
+
+    else:
+        # 2) Use provided axes
+        first = _first_axis(ax)
+        if first is None:
+            raise ValueError("Provided ax contains no valid Axes objects.")
+        fig = first.figure
+        ax_in = ax
+
+    # 3) Convert (if needed) + style recursively for all axes
+    def _convert_and_style(a):
+        a2 = _ensure_geoaxes(fig, a)
+        return _style_geoax(a2)
+
+    ax_out = map_axes(ax_in, _convert_and_style)
+
+    return fig, ax_out
+
+
+def create_cartopy(coastline_resolution='110m', figsize=(12, 12), fig=None, ax=None, central_longitude=45.0, proj=None, **kwargs):
     """
     Creates a Cartopy map using a North Polar Stereographic projection with adjustable coastline resolution.
 
@@ -53,13 +360,16 @@ def create_cartopy(coastline_resolution='110m', figsize=(12, 12), fig=None, ax=N
     Returns:
         tuple: A tuple containing the figure and axis with the configured map.
     """
+    if proj is None:
+        proj =  ccrs.NorthPolarStereo(central_longitude=central_longitude)
     if fig is None:
         fig, ax = plt.subplots(
             figsize=figsize,
-            subplot_kw={'projection': ccrs.NorthPolarStereo(central_longitude=45.0)}  # North Polar projection
+            subplot_kw={'projection': proj},  # North Polar projection
+            **kwargs
         )
     else:
-        ax = fig.add_subplot(ax, projection=ccrs.NorthPolarStereo(central_longitude=45.0))
+        ax = fig.add_subplot(ax, projection=proj)
 
     ax.set_facecolor(cfeature.COLORS['water'])
     
@@ -68,10 +378,11 @@ def create_cartopy(coastline_resolution='110m', figsize=(12, 12), fig=None, ax=N
         category='physical',
         name='land',
         scale=coastline_resolution,
-        edgecolor=cfeature.COLORS['land'],
+        edgecolor='none',#cfeature.COLORS['land'],
         facecolor=cfeature.COLORS['land']
     )
-    ax.add_feature(land, zorder=0)
+    ax.add_feature(land, zorder=1)  
+    ax.coastlines()
     
     # Add coastlines with the same resolution (optional, for more prominent coastlines)
     # ax.coastlines(resolution=coastline_resolution, linewidth=1, color='black', zorder=1)
@@ -122,16 +433,229 @@ def create_cartopy_grid(nrows=1, ncols=1, coastline_resolution='110m', figsize=N
                 category='physical',
                 name='land',
                 scale=coastline_resolution,
-                edgecolor=cfeature.COLORS['land'],
+                edgecolor='none',
                 facecolor=cfeature.COLORS['land']
             )
-            ax.add_feature(land, zorder=0)
+            ax.add_feature(land, zorder=1)
             
             # Add gridlines
             ax.gridlines(draw_labels=True, color='gray', zorder=9)
     
     plt.tight_layout()
     return fig, axes
+
+
+def _maybe_datetime64_1d(x):
+    x = np.asarray(x)
+    if x.dtype == object and x.size:
+        a0 = x.flat[0]
+        if isinstance(a0, (datetime.date, datetime.datetime, np.datetime64)):
+            return np.array([np.datetime64(t) for t in x.ravel()]).reshape(x.shape)
+    return x
+
+def _mapping_to_traj_times(traj_map, *, times):
+    # sort keys for deterministic time axis
+    keys = sorted(traj_map.keys())
+    if times is None:
+        times = np.array([np.datetime64(k) for k in keys])
+
+    vals = [traj_map[k] for k in keys]
+
+    # infer N from first non-None entry
+    first = next((v for v in vals if v is not None), None)
+    if first is None:
+        raise ValueError("All mapping values are None; nothing to plot.")
+
+    a0 = np.asarray(first)
+    if a0.shape[-1] != 2:
+        raise ValueError(f"Mapping values must have last dim 2, got {a0.shape}")
+
+    N = int(np.prod(a0.shape[:-1]))
+    T = len(keys)
+
+    out = np.full((N, T, 2), np.nan, dtype=float)
+
+    for t, v in enumerate(vals):
+        if v is None:
+            continue
+        a = np.asarray(v, dtype=float)
+        if a.shape[-1] != 2:
+            raise ValueError(f"Mapping value at {keys[t]!r} must have last dim 2, got {a.shape}")
+        a2 = a.reshape(-1, 2)
+        if a2.shape[0] != N:
+            raise ValueError(
+                f"Inconsistent N at {keys[t]!r}: expected {N} points, got {a2.shape[0]}"
+            )
+        out[:, t, :] = a2
+
+    return out, times
+
+
+def visualize_trajectory(
+    ax,
+    traj,
+    *,
+    time_first=False,
+    coord_order="latlon",          # "latlon" or "lonlat"
+    times=None,                    # None or array-like length T (numeric or datetime64)
+    cmap="viridis",
+    linewidth=1.5,
+    alpha=1,
+    zorder=10,
+    transform=None,                # defaults to ccrs.Geodetic()
+    unwrap_longitudes=True,        # helps dateline crossings
+    add_colorbar=False,
+    cbar_label=None,
+    cbar_kwargs=None,
+    start_end_markers=False,
+    marker_kwargs=None,
+    fast=False,                    # if True: uses LineCollection in PlateCarree (faster, not geodesic)
+):
+    """
+    Plot N trajectories (lat/lon) on a Cartopy axis, coloring by time along the path.
+
+    Parameters
+    ----------
+    ax : cartopy.mpl.geoaxes.GeoAxes
+        Axis created with a Cartopy projection (e.g., NorthPolarStereo).
+    traj : array-like, shape (N, T, 2)
+        Trajectories. By default expects (..., [lat, lon]).
+    coord_order : {"latlon", "lonlat"}
+        Order of coordinates in traj[..., 0:2].
+    times : None or array-like length T
+        If provided, colors by times (numeric or numpy datetime64). Otherwise uses time index.
+    transform : cartopy.crs.CRS
+        How to interpret the input lon/lat. For geodesic curves, use ccrs.Geodetic().
+    fast : bool
+        If True, uses a LineCollection in PlateCarree (fast but not true geodesic segments).
+    """
+
+    if isinstance(traj, Mapping):
+        traj, times = _mapping_to_traj_times(traj, times=times)
+    # Make your existing times handling also accept python date/datetime
+    if times is not None:
+        times = _maybe_datetime64_1d(times)
+
+    traj = np.asarray(traj)
+    if traj.ndim != 3 or traj.shape[-1] != 2:
+        raise ValueError(f"traj must have shape (N, T, 2), got {traj.shape}")
+    if time_first:
+        traj = np.swapaxes(traj, 0, 1)
+    N, T, _ = traj.shape
+    if T < 2:
+        raise ValueError("Trajectories must have T >= 2 to draw segments.")
+
+    if coord_order not in ("latlon", "lonlat"):
+        raise ValueError("coord_order must be 'latlon' or 'lonlat'")
+
+    if transform is None:
+        transform = ccrs.Geodetic()
+
+    if times is None:
+        # color per-segment by index 0..T-2
+        seg_values = np.arange(T - 1, dtype=float)
+        is_datetime = False
+    else:
+        times = np.asarray(times)
+        if times.shape[0] != T:
+            raise ValueError(f"times must have length T={T}, got {times.shape[0]}")
+        is_datetime = np.issubdtype(times.dtype, np.datetime64)
+
+        if is_datetime:
+            # seconds since epoch as int64 for normalization
+            # tnum = times.astype("datetime64[s]").astype("int64")
+            tnum = mdates.date2num(times.astype("datetime64[ms]").astype(object))
+            # per-segment midpoint time for nicer gradients
+            seg_values = 0.5 * (tnum[:-1] + tnum[1:])
+            vmin, vmax = tnum[0], tnum[-1]
+        else:
+            tnum = times.astype(float)
+            seg_values = 0.5 * (tnum[:-1] + tnum[1:])
+            vmin, vmax = np.nanmin(tnum), np.nanmax(tnum)
+
+    vmin = np.nanmin(seg_values)
+    vmax = np.nanmax(seg_values)
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+        # fallback if something degenerate happens
+        vmin, vmax = 0.0, 1.0
+
+    norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+    cmap_obj = cm.get_cmap(cmap)
+    sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap_obj)
+    sm.set_array([])
+
+    # Accurate geodesic mode: draw each segment with ax.plot(..., transform=ccrs.Geodetic())
+    def _unwrap_lon_1d(lon_1d):
+        lon_rad = np.deg2rad(lon_1d)
+        return np.rad2deg(np.unwrap(lon_rad, discont=np.deg2rad(180)))
+
+    lines = []
+    for i in range(N):
+        if coord_order == "latlon":
+            lat = traj[i, :, 0].astype(float)
+            lon = traj[i, :, 1].astype(float)
+        else:
+            lon = traj[i, :, 0].astype(float)
+            lat = traj[i, :, 1].astype(float)
+
+        if unwrap_longitudes:
+            valid = np.isfinite(lon) & np.isfinite(lat)
+            lon2 = lon.copy()
+            if valid.any():
+                idx = np.where(valid)[0]
+                lon2[idx] = _unwrap_lon_1d(lon[idx])
+            lon = lon2
+
+        # Plot each valid segment with its own color
+        for t in range(T - 1):
+            if not (np.isfinite(lon[t]) and np.isfinite(lat[t]) and np.isfinite(lon[t + 1]) and np.isfinite(lat[t + 1])):
+                continue
+            color = cmap_obj(norm(seg_values[t]))
+            ln = ax.plot(
+                [lon[t], lon[t + 1]],
+                [lat[t], lat[t + 1]],
+                transform=transform,     # Geodetic by default
+                color=color,
+                linewidth=linewidth,
+                alpha=alpha,
+                zorder=zorder,
+            )
+            lines.extend(ln)
+
+        if start_end_markers:
+            _mk = {} if marker_kwargs is None else dict(marker_kwargs)
+            if np.isfinite(lon[0]) and np.isfinite(lat[0]):
+                ax.plot([lon[0]], [lat[0]], marker="o", transform=transform, zorder=zorder + 1, **_mk)
+            if np.isfinite(lon[-1]) and np.isfinite(lat[-1]):
+                ax.plot([lon[-1]], [lat[-1]], marker="s", transform=transform, zorder=zorder + 1, **_mk)
+
+    if add_colorbar:
+        _cbar_kwargs = {} if cbar_kwargs is None else dict(cbar_kwargs)
+        label = cbar_label if cbar_label is not None else ("time" if times is not None else "t index")
+
+        cbar = ax.figure.colorbar(sm, ax=ax, **_cbar_kwargs)
+        cbar.set_label(label)
+
+        if is_datetime:
+            loc = mdates.AutoDateLocator(minticks=3, maxticks=7)
+            cbar.locator = loc
+            cbar.formatter = mdates.DateFormatter("%Y-%m-%d")
+            cbar.update_ticks()
+
+            # optional: make labels readable
+            ax_ = cbar.ax.xaxis if cbar.orientation == "horizontal" else cbar.ax.yaxis
+            for lab in ax_.get_ticklabels():
+                lab.set_rotation(30)
+                lab.set_ha("right")
+        # If times are datetime64, you can optionally pass your own ticks/formatter via cbar_kwargs.
+        # Keeping it simple here because we normalized in epoch-seconds.
+
+    return {"mappable": sm, "lines": lines}
+
+def true_ndim(a) -> int:
+    a = np.asarray(a)
+    shp = a.shape
+    return int(np.count_nonzero(np.array(shp) > 1))
 
 def visualize_scalar_field(ax, grid, field, if_colorbar=False, lat=None, lon=None, **kwargs):
     """
@@ -144,8 +668,14 @@ def visualize_scalar_field(ax, grid, field, if_colorbar=False, lat=None, lon=Non
         vmin (float, optional): Minimum value for color scale. Defaults to None.
         vmax (float, optional): Maximum value for color scale. Defaults to None.
     """
-    lat = lat if lat is not None else grid.latitude
-    lon = lon if lon is not None else grid.longitude
+    if lat is None and lon is None:
+        lat, lon = lat_lon_from_grid(grid)
+    # lat = lat if lat is not None else grid.latitude
+    # lon = lon if lon is not None else grid.longitude
+    
+    if field.ndim >= 3 and true_ndim(field) == 2:
+        field = np.squeeze(field)
+    assert field.ndim == 2, "Field must be 2D after squeezing"
 
     # Create a colored mesh plot of the scalar field, projected using Plate Carree
     layer = ax.pcolormesh(
@@ -157,10 +687,57 @@ def visualize_scalar_field(ax, grid, field, if_colorbar=False, lat=None, lon=Non
         **kwargs\
     )
     if if_colorbar:
-        # Add a color bar for reference
         plt.colorbar(layer)
     return layer
 
+def plot_countour(ax, grid, field, levels=None, lat=None, lon=None, if_label=False, colors=None, **kwargs):
+    """
+    Visualizes a scalar field on the map using a color mesh.
+
+    Args:
+        ax (matplotlib.axes._axes.Axes): Axis to plot on.
+        grid (Grid): Grid object containing lat/lon information.
+        field (np.array): Scalar field to visualize.
+        vmin (float, optional): Minimum value for color scale. Defaults to None.
+        vmax (float, optional): Maximum value for color scale. Defaults to None.
+    """
+    lat = lat if lat is not None else grid.latitude
+    lon = lon if lon is not None else grid.longitude
+    
+    if field.ndim >= 3 and true_ndim(field) == 2:
+        field = np.squeeze(field)
+    assert field.ndim == 2, "Field must be 2D after squeezing"
+
+    # Create a colored mesh plot of the scalar field, projected using Plate Carree
+    fieldm = np.ma.masked_invalid(field).copy()
+    jump = np.abs(np.diff(lon, axis=1)) > 180  # dateline crossings between columns
+
+    mask = np.zeros(fieldm.shape, dtype=bool)
+    mask[:, 1:] |= jump
+    mask[:, :-1] |= jump
+    fieldm = np.ma.masked_where(mask, fieldm)
+
+    line_c = ax.contour(
+        lon,
+        lat,
+        fieldm,
+        transform=ccrs.PlateCarree(),
+        alpha=None,
+        levels=levels,
+        colors=colors,
+        transform_first=False,
+        **kwargs
+    )
+    if if_label: # works bad for my case, want to move it to legend
+        ax.clabel(
+            line_c,  # Typically best results when labelling line contours.
+            colors=colors,
+            manual=False,  # Automatic placement vs manual placement.
+            inline=True,  # Cut the line where the label will be placed.
+            fmt='{:.0f}'.format,
+            fontsize=8.0,
+            )
+    return line_c
 
 def block_average(arr, step, min_valid=None):
     """
@@ -184,7 +761,7 @@ def block_average(arr, step, min_valid=None):
 
 def visualize_vector_field(ax, grid, field, key_length=50, draw_quiverkey=True, key_units='cm/s', key_color='black', 
                            from_polar=False, from_direction=True, step=64, use_pooling=True, min_valid=5,
-                           scale=None, width=0.002, headwidth=3, headlength=5):
+                           scale=None, width=0.002, headwidth=3, headlength=5, **quiver_kwargs):
     """
     Visualizes a vector field on the map using quiver arrows, with optional block average pooling.
     Uses block-averaging for vector components but selects the geographic center of each block for
@@ -220,7 +797,8 @@ def visualize_vector_field(ax, grid, field, key_length=50, draw_quiverkey=True, 
             scale=scale,
             width=width,
             headwidth=headwidth,
-            headlength=headlength
+            headlength=headlength,
+            **quiver_kwargs
         )
     else:
         layer = ax.quiver(
@@ -230,49 +808,101 @@ def visualize_vector_field(ax, grid, field, key_length=50, draw_quiverkey=True, 
             scale=scale,
             width=width,
             headwidth=headwidth,
-            headlength=headlength
+            headlength=headlength,
+            **quiver_kwargs
         )
     if draw_quiverkey:
         ax.quiverkey(layer, X=0.69, Y=0.2, U=key_length, label=f'{key_length} {key_units}',
                     labelpos='E', coordinates='axes')
     return layer
 
+def plot_barbs(
+    ax, grid, field,
+    draw_barbkey=True,
+    key_units="cm/s",
+    key_color="black",
+    key_X=0.69, key_Y=0.2,
+    key_w=0.28, key_h=0.08,
+    from_polar=False,
+    from_direction=True,
+    step=64,
+    use_pooling=True,
+    min_valid=5,
+    length=6,
+    **barb_kwargs
+):
+    if from_polar:
+        norm, angle = field
+        u, v = polar_to_cartesian(norm, angle, from_direction=from_direction)
+    else:
+        u, v = field
 
-# def visualize_vector_field(ax, grid, field, key_length=50, key_units='cm/s', key_color='black', 
-#                            from_polar=False, from_direction=True, step=16):
-#     """
-#     Visualizes a vector field on the map using quiver arrows.
-    
-#     Args:
-#         ax (matplotlib.axes._axes.Axes): Axis to plot on.
-#         grid (Grid): Grid object containing lat/lon information.
-#         field (np.array): Either (u, v) or (norm, angle) depending on from_polar.
-#         key_length (int, optional): Length of the quiver key. Defaults to 50.
-#         key_units (str, optional): Units of the quiver key. Defaults to 'cm/s'.
-#         key_color (str, optional): Color of the quiver arrows. Defaults to 'black'.
-#         from_polar (bool): If True, field is treated as (norm, angle). Defaults to False.
-#         from_direction (bool): If using from_polar, whether angle is a FROM direction. Defaults to True.
-#     """
-#     if from_polar:
-#         norm, angle = field
-#         u, v = polar_to_cartesian(norm, angle, from_direction=from_direction)
-#     else:
-#         u, v = field
-    
-#     field_fixed = fix_quiver_bug((u, v), grid.lat)
+    u_fixed, v_fixed = fix_quiver_bug((u, v), grid.lat)
+    h, w = grid.lon.shape
 
-#     layer = ax.quiver(
-#         grid.lon[::step, ::step],
-#         grid.lat[::step, ::step],
-#         field_fixed[0][::step, ::step],
-#         field_fixed[1][::step, ::step],
-#         transform=ccrs.PlateCarree(),
-#         color=key_color,
-#     )
+    if use_pooling and step > 1:
+        u_p = block_average(u_fixed, step, min_valid)
+        v_p = block_average(v_fixed, step, min_valid)
 
-#     ax.quiverkey(layer, X=0.69, Y=0.2, U=key_length, label=f'{key_length} {key_units}',
-#                  labelpos='E', coordinates='axes')
-#     return layer
+        h2 = (h // step) * step
+        w2 = (w // step) * step
+        i_centers = (np.arange(step // 2, h2, step)).astype(int)
+        j_centers = (np.arange(step // 2, w2, step)).astype(int)
+
+        lon_p = grid.lon[i_centers[:, None], j_centers[None, :]]
+        lat_p = grid.lat[i_centers[:, None], j_centers[None, :]]
+
+        mask = (~np.isnan(u_p) & ~np.isnan(v_p))
+        x = lon_p[mask]
+        y = lat_p[mask]
+        uu = u_p[mask]
+        vv = v_p[mask]
+    else:
+        x = grid.lon[::step, ::step].ravel()
+        y = grid.lat[::step, ::step].ravel()
+        uu = u_fixed[::step, ::step].ravel()
+        vv = v_fixed[::step, ::step].ravel()
+
+        mask = (~np.isnan(uu) & ~np.isnan(vv))
+        x, y, uu, vv = x[mask], y[mask], uu[mask], vv[mask]
+
+    barb_kwargs = dict(barb_kwargs)
+    barb_kwargs.setdefault("barbcolor", key_color)
+    barb_kwargs.setdefault("flagcolor", key_color)
+
+    layer = ax.barbs(
+        x, y, uu, vv,
+        transform=ccrs.PlateCarree(),
+        length=length,
+        **barb_kwargs
+    )
+
+    if draw_barbkey:
+        key_ax = ax.inset_axes([key_X, key_Y, key_w, key_h], transform=ax.transAxes)
+        key_ax.set_axis_off()
+        key_ax.set_xlim(0, 1)
+        key_ax.set_ylim(0, 1)
+
+        # Use a clean kwargs dict for the key (avoid duplicate barbcolor/flagcolor)
+        key_kwargs = dict(barb_kwargs)
+        key_kwargs.pop("transform", None)  # not meaningful for inset axis
+
+        key_ax.barbs(
+            [0.15]*3, [0.7, 0.5, 0.3],
+            [50, 10, 5], [0.0]*3,
+            length=length,
+            **key_kwargs
+        )
+        key_ax.text(
+            0.28, 0.5, f"50 {key_units}\n10 {key_units}\n5 {key_units}",
+            va="center", ha="left",
+            color=key_color,
+            transform=key_ax.transAxes,
+        )
+
+        layer._barbkey_ax = key_ax
+
+    return layer
 
 
 def show_validation_table(rows, columns, data, title):
@@ -363,17 +993,19 @@ def get_color_params(metric_name, vmin, vmax):
 
 def plot_error_evolution(
     error_data: Dict[date, float],
-    title: str = "Error Evolution Over Time",
-    xlabel: str = "Date",
-    ylabel: str = "Error",
+    title: str = None,
+    xlabel: str = None,
+    ylabel: str = None,
     color: str = "tab:blue",
     figsize: tuple = (12, 6),
     grid: bool = True,
     marker: str = None,
-    date_format: str = "%Y-%m-%d",
+    date_format: str = "%Y-%m-%dT%H",
+    date_step: str = "1D",
     label_rotation: int = 45,
     ax: Optional[plt.Axes] = None,
     label: Optional[str] = None,
+    **plot_kwargs,
 ) -> tuple[plt.Figure, plt.Axes]:
     """
     Plot one or multiple error evolution charts on the same figure.
@@ -387,14 +1019,25 @@ def plot_error_evolution(
     # Extract and sort dates and errors
     start_date = min(error_data)
     end_date = max(error_data)
-    dates = [start_date + datetime.timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+    
+    if isinstance(start_date, (datetime.datetime, datetime.date, np.datetime64)):
+        dates = np.arange(start_date, end_date + np.timedelta64(1, date_step), np.timedelta64(1, date_step)).astype(type(start_date))
+    elif isinstance(start_date, (int, float)):
+        dates = np.arange(start_date, end_date + 1, 1)
+    else:
+        raise ValueError("error_data keys must be datetime-like for date handling")
+
+    # dates = [start_date + datetime.timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+    # dates = list(error_data.keys())
     errors=[]
     for d in dates:
         value = error_data.get(d, np.array([np.nan]))
+        if isinstance(value, dict) and 'sum' in value and 'count' in value:
+            value = value['sum'] / value['count']
         try:
-            value = value.item() # Convert to scalar if possible
-        except AttributeError:
-            pass
+            value = value.squeeze().item() # Convert to scalar if possible
+        except (AttributeError, ValueError):
+            value = None
         errors.append(value)
 
     # Create figure and axes if not provided
@@ -406,28 +1049,34 @@ def plot_error_evolution(
         new_plot = False
 
     # Plot the data
-    ax.plot(dates, errors, marker=marker, linestyle="-", 
-            color=color, label=label)
+    ax.plot(dates, errors, marker=marker, 
+            color=color, label=label, **plot_kwargs)
     if label:
         ax.legend()
     # Only configure axis properties for new plots
-    if new_plot:
-        # Configure date formatting
-        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-        ax.xaxis.set_major_formatter(mdates.DateFormatter(date_format))
-        
-        # Rotate and align labels
-        plt.setp(ax.get_xticklabels(), rotation=label_rotation, ha="right")
+    # if new_plot:
+    # Configure date formatting
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter(date_format))
+    
+    # Rotate and align labels
+    plt.setp(ax.get_xticklabels(), rotation=label_rotation, ha="right")
 
-        # Set labels and title
-        ax.set(xlabel=xlabel, ylabel=ylabel, title=title)
-        
-        # Add grid
-        if grid:
-            ax.grid(True, alpha=0.3)
+    # Set labels and title
+    if xlabel is not None:
+        ax.set_xlabel(xlabel)
+    if ylabel is not None:
+        ax.set_ylabel(ylabel)
+    if title is not None:
+        ax.set_title(title)
+    # ax.set(xlabel=xlabel, ylabel=ylabel, title=title)
+    
+    # Add grid
+    if grid:
+        ax.grid(True, alpha=0.3)
 
-        # Adjust layout
-        fig.tight_layout()
+    # Adjust layout
+    fig.tight_layout()
     return fig, ax
 
 
@@ -703,3 +1352,363 @@ def plot_vector_field_scatter(errors, units='cm/s'):
     plt.tight_layout()
     plt.subplots_adjust(hspace=0.05, wspace=0.05)
     return fig, (ax_scatter, ax_histx, ax_histy)
+
+
+def pad_extent_km(extent_proj, pad_km):
+    xmin, xmax, ymin, ymax = map(float, extent_proj)
+
+    pad_km = np.asarray(pad_km, dtype=float)
+    if pad_km.size == 1:
+        pad_x_km = pad_y_km = float(pad_km)
+    elif pad_km.size == 2:
+        pad_x_km, pad_y_km = map(float, pad_km)
+    else:
+        raise ValueError("pad_km must be scalar or (pad_x_km, pad_y_km).")
+
+    pad_x_m = pad_x_km * 1000.0
+    pad_y_m = pad_y_km * 1000.0
+    return [xmin - pad_x_m, xmax + pad_x_m, ymin - pad_y_m, ymax + pad_y_m]
+
+
+def broaden_extent_from_ax_km(ax, pad_km, *, target_crs=None):
+    """
+    Broaden the *current* GeoAxes extent by pad_km in target_crs coordinates.
+
+    - If target_crs is None, uses ax.projection.
+    - target_crs should be a projected CRS with meter units for "km" to be literal.
+    """
+    if target_crs is None:
+        target_crs = ax.projection
+
+    # extent in target_crs coordinates (meters for most projected CRSs)
+    extent = ax.get_extent(crs=target_crs)   # (xmin, xmax, ymin, ymax)
+    extent2 = pad_extent_km(extent, pad_km)
+    ax.set_extent(extent2, crs=target_crs)
+    return extent2
+
+
+def _agg_per_valid_time(valid_dt, err, *, agg="nanmedian"):
+    """
+    Aggregate err at identical valid_dt timestamps.
+    Returns sorted unique times + aggregated values.
+    """
+    if valid_dt.size == 0:
+        return valid_dt, err
+
+    # group by exact timestamp (ns)
+    order = np.argsort(valid_dt)
+    t = valid_dt[order]
+    e = err[order]
+
+    # unique groups
+    uniq, idx_start, counts = np.unique(t, return_index=True, return_counts=True)
+
+    # aggregate
+    agg_fn = getattr(np, agg)
+    out = np.full(uniq.shape, np.nan, dtype=float)
+
+    for i, (s, c) in enumerate(zip(idx_start, counts)):
+        out[i] = agg_fn(e[s:s+c])
+
+    return uniq, out
+
+def _as_date(d):
+    """Coerce python date/datetime or numpy datetime64 -> python date."""
+    if isinstance(d, datetime.datetime):
+        return d.date()
+    if isinstance(d, datetime.date):
+        return d
+    if isinstance(d, np.datetime64):
+        return d.astype("datetime64[D]").astype(object)  # -> datetime.date
+    raise TypeError(f"Unsupported key type: {type(d)!r}")
+
+def _as_datetime(d, *, init_hour=0):
+    """Key is usually a date; interpret forecast init at init_hour:00."""
+    dd = _as_date(d)
+    return datetime.datetime.combine(dd, datetime.time(hour=int(init_hour)))
+
+def flatten_forecast_error_dict(
+    error_by_init,
+    *,
+    init_hour=0,
+    dt_hours=1,
+    lead_max=None,
+    drop_first_lead0=False,
+):
+    """
+    Parameters
+    ----------
+    error_by_init : dict[date -> array(T,1) or (T,)]
+        Forecast error vs lead time for each initialization date.
+    init_hour : int
+        Hour of initialization for each date key (commonly 0, 6, 12, 18).
+    dt_hours : int/float
+        Lead-time step in hours between consecutive elements in the array.
+    lead_max : int/None
+        If set, keep only leads <= lead_max (hours).
+    drop_first_lead0 : bool
+        If True, drop lead=0 point (often trivially 0).
+
+    Returns
+    -------
+    valid_dt : np.ndarray[datetime64[ns]] shape (N,)
+    lead_h   : np.ndarray[float] shape (N,)
+    err      : np.ndarray[float] shape (N,)
+    init_dt  : np.ndarray[datetime64[ns]] shape (N,)
+    """
+    valid_list, lead_list, err_list, init_list = [], [], [], []
+
+    for k, v in error_by_init.items():
+        if v is None:
+            continue
+        init_py = _as_datetime(k, init_hour=init_hour)
+        init64 = np.datetime64(init_py, "ns")
+
+        a = np.asarray(v, dtype=float).reshape(-1)  # (T,)
+        T = a.size
+        if T == 0:
+            continue
+
+        lead = np.arange(T, dtype=float) * float(dt_hours)
+
+        if drop_first_lead0 and T > 0:
+            a = a[1:]
+            lead = lead[1:]
+
+        if lead_max is not None:
+            mask = lead <= float(lead_max)
+            a = a[mask]
+            lead = lead[mask]
+
+        # valid time = init + lead
+        # (use seconds to avoid fractional-hour datetime issues)
+        valid64 = init64 + (lead * 3600.0).astype("timedelta64[s]").astype("timedelta64[ns]")
+
+        valid_list.append(valid64)
+        lead_list.append(lead)
+        err_list.append(a)
+        init_list.append(np.full(a.shape, init64, dtype="datetime64[ns]"))
+
+    if not valid_list:
+        return (
+            np.array([], dtype="datetime64[ns]"),
+            np.array([], dtype=float),
+            np.array([], dtype=float),
+            np.array([], dtype="datetime64[ns]"),
+        )
+
+    valid_dt = np.concatenate(valid_list)
+    lead_h   = np.concatenate(lead_list)
+    err      = np.concatenate(err_list)
+    init_dt  = np.concatenate(init_list)
+
+    return valid_dt, lead_h, err, init_dt
+
+def plot_overlapping_forecast_errors(
+    error_by_init,
+    *,
+    init_hour=0,
+    dt_hours=1,
+    lead_max=None,
+    mode="spaghetti",          # "spaghetti" or "scatter_by_lead"
+    overlay_agg=False,
+    agg="nanmedian",           # "nanmedian" or "nanmean"
+    overlay_kwargs=None,
+    alpha=0.20,
+    linewidth=1.0,
+    linestyle='-',
+    s=10,
+    cmap="viridis",
+    show_colorbar=True,
+    colorbar_label="Lead time (hours)",
+    ax=None,
+    title=None,
+    ylabel="Error",
+):
+    valid_dt, lead_h, err, init_dt = flatten_forecast_error_dict(
+        error_by_init,
+        init_hour=init_hour,
+        dt_hours=dt_hours,
+        lead_max=lead_max,
+    )
+
+    m = np.isfinite(err) & np.isfinite(lead_h)
+    valid_dt, lead_h, err, init_dt = valid_dt[m], lead_h[m], err[m], init_dt[m]
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(14, 5))
+    else:
+        fig = ax.figure
+
+    if valid_dt.size == 0:
+        ax.set_ylabel("Error (m)")
+        ax.set_title(title or "Forecast error vs valid time (overlapping horizons)")
+        ax.grid(True, alpha=0.25)
+        fig.tight_layout()
+        return fig, ax
+
+    # one shared normalization for ALL lines / points
+    norm = Normalize(vmin=np.nanmin(lead_h), vmax=np.nanmax(lead_h))
+
+    if mode == "spaghetti":
+        inits = np.unique(init_dt)
+
+        for it in inits:
+            mm = init_dt == it
+            tt = valid_dt[mm]
+            ee = err[mm]
+            ll = lead_h[mm]
+
+            if tt.size < 2:
+                continue
+
+            o = np.argsort(tt)
+            tt = tt[o]
+            ee = ee[o]
+            ll = ll[o]
+
+            x = mdates.date2num(tt.astype("datetime64[ms]").astype(object))
+
+            points = np.column_stack([x, ee]).reshape(-1, 1, 2)
+            segments = np.concatenate([points[:-1], points[1:]], axis=1)
+
+            # color each segment by midpoint lead time
+            seg_lead = 0.5 * (ll[:-1] + ll[1:])
+
+            lc = LineCollection(
+                segments,
+                cmap=cmap,
+                norm=norm,
+                linewidth=linewidth,
+                linestyle=linestyle,
+                alpha=alpha,
+            )
+            lc.set_array(seg_lead)
+            ax.add_collection(lc)
+
+        ax.autoscale_view()
+
+        if show_colorbar:
+            sm = ScalarMappable(norm=norm, cmap=cmap)
+            sm.set_array([])
+            cbar = fig.colorbar(sm, ax=ax, pad=0.01)
+            cbar.set_label(colorbar_label)
+
+    elif mode == "scatter_by_lead":
+        sc = ax.scatter(
+            valid_dt.astype("datetime64[ms]").astype(object),
+            err,
+            c=lead_h,
+            s=s,
+            alpha=alpha,
+            cmap=cmap,
+            norm=norm,
+            linewidths=0,
+        )
+        if show_colorbar:
+            cbar = fig.colorbar(sc, ax=ax, pad=0.01)
+            cbar.set_label(colorbar_label)
+
+    else:
+        raise ValueError("mode must be 'spaghetti' or 'scatter_by_lead'")
+
+    if overlay_agg and valid_dt.size:
+        t_uniq, e_agg = _agg_per_valid_time(valid_dt, err, agg=agg)
+        ok = np.isfinite(e_agg)
+        _okw = dict(color="black", linewidth=2.5, alpha=0.9)
+        if overlay_kwargs:
+            _okw.update(overlay_kwargs)
+        ax.plot(
+            t_uniq[ok].astype("datetime64[ms]").astype(object),
+            e_agg[ok],
+            **_okw,
+        )
+
+    ax.set_ylabel(ylabel)
+    ax.set_title(title or "Forecast error vs valid time (overlapping horizons)")
+
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=10))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d\n%H:%M"))
+    for lab in ax.get_xticklabels():
+        lab.set_rotation(0)
+        lab.set_ha("center")
+
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    return fig, ax
+
+
+def visualize_scatter(
+    ax,
+    coords,
+    values=None,
+    *,
+    order='latlon',
+    if_colorbar=False,
+    colorbar_kwargs=None,
+    **kwargs,
+):
+    """
+    Plot scattered geographic points on a Cartopy axis.
+
+    Parameters
+    ----------
+    ax : cartopy.mpl.geoaxes.GeoAxes
+        Target Cartopy axis.
+    coords : np.ndarray
+        Array of shape (N, 2), where columns are either [lat, lon] or [lon, lat].
+    values : np.ndarray or None
+        Optional array of shape (N,) used for point coloring via `c=...`.
+    order : str
+        'latlon' or 'lonlat'.
+    if_colorbar : bool
+        Whether to add a colorbar.
+    colorbar_kwargs : dict or None
+        Extra kwargs passed to plt.colorbar.
+    **kwargs
+        Extra kwargs passed to ax.scatter (e.g. s, cmap, vmin, vmax, alpha, marker).
+
+    Returns
+    -------
+    layer : matplotlib.collections.PathCollection
+        Scatter plot handle.
+    """
+    coords = np.asarray(coords, dtype=float)
+    if coords.ndim != 2 or coords.shape[1] != 2:
+        raise ValueError(f"`coords` must have shape (N, 2), got {coords.shape}")
+
+    if order == 'latlon':
+        lat = coords[:, 0]
+        lon = coords[:, 1]
+    elif order == 'lonlat':
+        lon = coords[:, 0]
+        lat = coords[:, 1]
+    else:
+        raise ValueError("`order` must be either 'latlon' or 'lonlat'")
+
+    mask = np.isfinite(lat) & np.isfinite(lon)
+
+    c = values
+    if values is not None:
+        values = np.asarray(values)
+        if values.shape[0] != coords.shape[0]:
+            raise ValueError(
+                f"`values` must have length {coords.shape[0]}, got {values.shape[0]}"
+            )
+        if values.ndim == 1 and np.issubdtype(values.dtype, np.number):
+            mask &= np.isfinite(values)
+        c = values[mask]
+
+    layer = ax.scatter(
+        lon[mask],
+        lat[mask],
+        c=c,
+        transform=ccrs.PlateCarree(),
+        **kwargs,
+    )
+
+    if if_colorbar and values is not None:
+        cb_kwargs = {} if colorbar_kwargs is None else dict(colorbar_kwargs)
+        plt.colorbar(layer, ax=ax, **cb_kwargs)
+
+    return layer
