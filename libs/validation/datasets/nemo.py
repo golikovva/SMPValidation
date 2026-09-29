@@ -1,13 +1,14 @@
 from datetime import datetime
 
 import xarray as xr
-
+import numpy as np
 from libs.validation import Grid
 from libs.validation.datasets.base import (
     Dataset,
     ModelDriftDataset,
     ModelEastCurrentDataset,
     ModelNorthCurrentDataset,
+    ModelCurrentDataset,
     ModelSalinityDataset,
     ModelSurfaceSalinityDataset,
     ModelSicDataset,
@@ -44,7 +45,7 @@ class NemoDataset(Dataset):
         return grid
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Returns the file template pattern for locating NEMO model dataset files.
 
@@ -113,18 +114,71 @@ class NemoDriftDataset(ModelDriftDataset, NemoDataset):
 
 
 class NemoThickDataset(ModelThickDataset, NemoDataset):
+    """NEMO sea-ice thickness over the ice-covered part of each cell.
+
+    ``thickness_source="sithic"`` reads thickness directly (the default).
+    ``thickness_source="sivolu"`` derives thickness as ``sivolu / siconc``
+    for each time sample, before time averaging or interpolation. In this
+    mode, ``sivolu`` must be ice volume per cell area in metres, and
+    ``siconc`` must be a fraction in [0, 1], not a percentage.
+
+    Ice-free cells, missing/invalid values and land remain NaN. If siconc
+    is available in direct mode, it is also used to mask ice-free cells.
     """
-    Dataset class for handling NEMO sea ice thickness data.
-    """
+
+    def __init__(
+        self,
+        path,
+        dst_grid=None,
+        average_times=None,
+        name=None,
+        *,
+        files_template=None,
+        thickness_source="sithic",
+        interpolation_cache_dir=None,
+    ):
+        if thickness_source not in ("sithic", "sivolu"):
+            raise ValueError("thickness_source must be 'sithic' or 'sivolu'")
+        self.thickness_source = thickness_source
+        super().__init__(
+            path, dst_grid, average_times, name, files_template=files_template,
+            interpolation_cache_dir=interpolation_cache_dir,
+        )
+
+    def _process_field(self, field):
+        """Preserve missing values and mask nonpositive thickness and land."""
+        field = np.where(np.isfinite(field) & (field > 0), field, np.nan)
+        field[:, self.src_grid.land_mask()] = np.nan
+        return field
+
+    def _extract_data(self, file, load_fn=xr.open_dataset):
+        """Read or derive thickness with shape (time, 1, y, x)."""
+        with load_fn(file) as ds:
+            if self.thickness_source == "sivolu":
+                field = ds["sivolu"]
+                concentration = ds["siconc"]
+            else:
+                field = ds[self._thick_variable]
+                concentration = ds.get("siconc")
+
+            if concentration is not None:
+                valid_ice = (
+                    np.isfinite(concentration)
+                    & (concentration > 0)
+                    & (concentration <= 1)
+                )
+                if self.thickness_source == "sivolu":
+                    field = field / concentration.where(valid_ice)
+                else:
+                    field = field.where(valid_ice)
+
+            data = self._process_field(field.values)
+
+        return data[:, None, :, :]
 
     @property
     def _thick_variable(self):
-        """
-        Specifies the sea ice thickness variable.
-
-        Returns:
-            str: The variable name for sea ice thickness.
-        """
+        """Name of the variable used for directly stored ice thickness."""
         return 'sithic'
 
 
@@ -134,7 +188,7 @@ class NemoSalinityDataset(ModelSalinityDataset, NemoDataset):
     """
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Returns the file template for locating NEMO salinity data files.
 
@@ -159,7 +213,7 @@ class NemoSurfaceSalinityDataset(ModelSurfaceSalinityDataset, NemoDataset):
     """
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Returns the file template for locating NEMO salinity data files.
 
@@ -185,7 +239,7 @@ class NemoTemperatureDataset(ModelTemperatureDataset, NemoDataset):
     """
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Returns the file template for locating NEMO temperature data files.
 
@@ -210,7 +264,7 @@ class NemoSurfaceTemperatureDataset(ModelSurfaceTemperatureDataset, NemoDataset)
     """
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Returns the file template for locating NEMO temperature data files.
 
@@ -235,7 +289,7 @@ class NemoEastCurrentDataset(ModelEastCurrentDataset, NemoDataset):
     """
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Returns the file template for locating NEMO eastward current data files.
 
@@ -261,7 +315,7 @@ class NemoNorthCurrentDataset(ModelNorthCurrentDataset, NemoDataset):
     """
 
     @property
-    def _files_template(self):
+    def _default_files_template(self) -> str:
         """
         Returns the file template for locating NEMO northward current data files.
 
@@ -279,3 +333,99 @@ class NemoNorthCurrentDataset(ModelNorthCurrentDataset, NemoDataset):
             str: The variable name for northward current data.
         """
         return 'vomecrty'
+    
+
+class NemoCurrentDataset(ModelCurrentDataset, NemoDataset):
+    """
+    Dataset class for handling NEMO sea ice current data.
+    """
+
+    @property
+    def _default_files_template(self) -> str:
+        """
+        Returns the file template for locating NEMO northward current data files.
+
+        Returns:
+            str: The file path template for northward current data.
+        """
+        return 'run_*/NESTP12-VP1_*_forecast.*_gridV*.nc'
+    
+    @property
+    def _east_cur_variable(self):
+        """
+        Specifies the u-component current variable.
+
+        Returns:
+            str: The variable name for the u-component of sea ice current.
+        """
+        return 'vozocrtx'
+
+    @property
+    def _north_cur_variable(self):
+        """
+        Specifies the v-component current variable.
+
+        Returns:
+            str: The variable name for the v-component of sea ice current.
+        """
+        return 'vomecrty'
+    
+
+
+class NemoGeneralIceDataset(NemoDataset):
+    def __init__(
+        self,
+        path,
+        variables,
+        dst_grid=None,
+        average_times=None,
+        name=None,
+        mask_var=None,
+        *,
+        files_template=None,
+        interpolation_cache_dir=None,
+    ):
+        self.variables=variables
+        self.mask_var=mask_var
+        super().__init__(
+            path, dst_grid, average_times, name, files_template=files_template,
+            interpolation_cache_dir=interpolation_cache_dir,
+        )
+
+    """
+    Dataset class for handling combined current velocity (eastward and northward components).
+    """
+
+    def _process_field(self, field):
+        """
+        Processes the current velocity field without additional transformations.
+
+        Args:
+            field (np.array): Raw current velocity data.
+
+        Returns:
+            np.array: Processed current velocity data.
+        """
+        return field  # No processing required for current velocity
+
+    def _extract_data(self, file, load_fn=xr.open_dataset):
+        """
+        Extracts current velocity data (eastward and northward components) from the given file.
+
+        Args:
+            file (str): Path to the data file.
+            load_fn (callable, optional): Function to load the file.
+
+        Returns:
+            np.array: Extracted and combined current velocity data.
+        """
+        ds = load_fn(file)
+        data = []
+        for variable in self.variables:
+            if self.mask_var is not None:
+                values = ds.variables[variable].values * ds.variables[self.mask_var].values
+            else:
+                values = ds.variables[variable].values 
+            data.append(values)
+        data = np.stack([self._process_field(field) for field in data], axis=1)
+        return data
