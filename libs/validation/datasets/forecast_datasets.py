@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import NamedTuple, Optional, Dict, List, Tuple, Any
 from datetime import datetime
 import warnings
+import re
 
 from abc import abstractmethod
 from pathlib import Path
@@ -45,6 +46,7 @@ class ForecastDatasetBase(Dataset):
         self,
         data_folder,
         data_variables=None,
+        transform=None,
         expected_init_step_h=None,
         expected_lead_step_h=None,
         expected_max_lead_h=None,
@@ -61,6 +63,7 @@ class ForecastDatasetBase(Dataset):
         self.add_coords = add_coords
         self.add_time_encoding = add_time_encoding
         self.strict = strict
+        self.transform = transform
 
         self.constant_vars = {}
         self.runs_dict = self._create_runs_dict()
@@ -160,6 +163,11 @@ class ForecastDatasetBase(Dataset):
     def __getitem__(self, init_time):
         return self.get_run(init_time)
 
+    @property
+    def grid(self):
+        # if self.dst_grid is not None:  # todo
+        #     return self.dst_grid
+        return self.src_grid
 
 class GFSGluedForecastDataset(ForecastDatasetBase):
     """
@@ -278,9 +286,389 @@ class GFSGluedForecastDataset(ForecastDatasetBase):
 
         # concat over channel axis -> (C, T, H, W) or similar intermediate
         npy = np.concatenate(npy, axis=0)
+        npy = np.transpose(npy, (1, 0, 2, 3))
         # to (T, C, H, W)
-        return np.transpose(npy, (1, 0, 2, 3))
+        if self.transform:
+            npy = self.transform(npy)
+        return npy
     
+
+class GFSGribForecastDataset(ForecastDatasetBase):
+    """
+    Forecast dataset for per-lead GFS GRIB files.
+
+    Supported layouts include Herbie subset files:
+        20260301/subset_80ef7196__gfs.t00z.pgrb2.0p25.f000
+
+    and NOMADS-style subset files:
+        date=20260425/cycle=00/gfs.t00z.pgrb2.0p25.f000.subset.grib2
+
+    The matching .idx inventory files are ignored.
+    """
+
+    _gfs_file_re = re.compile(
+        r"(?:^|__)gfs\.t(?P<cycle>\d{2})z\.(?P<product>.+?)\.f(?P<lead>\d{3})(?:$|[._])"
+    )
+
+    def __init__(self, *args, product: str = "pgrb2.0p25", **kwargs):
+        self.product = product
+        super().__init__(*args, **kwargs)
+
+    @property
+    def _files_template(self):
+        return "**/*gfs*.f*"
+
+    @staticmethod
+    def _import_pygrib():
+        try:
+            import pygrib
+        except ImportError as exc:
+            raise ImportError(
+                "GFSGribForecastDataset requires pygrib to read GRIB files."
+            ) from exc
+        return pygrib
+
+    @classmethod
+    def _match_gfs_file(cls, file: Path):
+        return cls._gfs_file_re.search(file.name)
+
+    def _is_data_file(self, file: Path) -> bool:
+        if not file.is_file() or file.name.endswith(".idx"):
+            return False
+
+        match = self._match_gfs_file(file)
+        if match is None:
+            return False
+
+        return self.product is None or match.group("product") == self.product
+
+    def _iter_grib_files(self):
+        for file in sorted(self.path.glob(self._files_template)):
+            if self._is_data_file(file):
+                yield file
+
+    @staticmethod
+    def _date_from_path(file: Path) -> str:
+        for part in reversed(file.parts[:-1]):
+            candidate = part.split("=", 1)[-1]
+            if re.fullmatch(r"\d{8}", candidate):
+                return candidate
+
+        match = re.search(r"(?:^|[._-])(?P<date>\d{8})(?:[._-]|$)", file.name)
+        if match is not None:
+            return match.group("date")
+
+        raise ValueError(
+            f"Could not parse GFS init date from {file}. "
+            "Expected an ancestor folder like 20260301 or date=20260301."
+        )
+
+    @classmethod
+    def _parse_lead_h(cls, file: Path) -> int:
+        match = cls._match_gfs_file(file)
+        if match is None:
+            raise ValueError(f"Could not parse GFS lead time from {file.name}")
+        return int(match.group("lead"))
+
+    @classmethod
+    def _parse_cycle(cls, file: Path) -> str:
+        match = cls._match_gfs_file(file)
+        if match is None:
+            raise ValueError(f"Could not parse GFS cycle from {file.name}")
+        return match.group("cycle")
+
+    @classmethod
+    def _parse_init_time(cls, file: Path) -> np.datetime64:
+        date_part = cls._date_from_path(file)
+        cycle = cls._parse_cycle(file)
+        dt = datetime.strptime(f"{date_part}{cycle}", "%Y%m%d%H")
+        return np.datetime64(dt).astype("datetime64[h]")
+
+    def _create_runs_dict(self):
+        grouped: Dict[np.datetime64, Dict[int, Path]] = {}
+
+        for file in self._iter_grib_files():
+            init_time = self._parse_init_time(file)
+            lead_h = self._parse_lead_h(file)
+            run_files = grouped.setdefault(init_time, {})
+
+            if lead_h in run_files:
+                msg = (
+                    f"Duplicate GFS file for init={init_time}, lead={lead_h}h: "
+                    f"{run_files[lead_h]} and {file}. Keeping the first one."
+                )
+                if self.strict:
+                    raise ValueError(msg)
+                warnings.warn(msg)
+                continue
+
+            run_files[lead_h] = file
+
+        runs = {}
+        for init_time, lead_to_file in sorted(grouped.items()):
+            files = [file for _, file in sorted(lead_to_file.items())]
+            lead_times_h = self._read_lead_axis_h(files)
+            if lead_times_h is None:
+                continue
+
+            valid_times = init_time + lead_times_h.astype("timedelta64[h]")
+            runs[init_time] = ForecastRunRecord(
+                init_time=init_time,
+                files=files,
+                lead_times_h=lead_times_h,
+                valid_times=valid_times,
+            )
+
+        return runs
+
+    def _create_grid(self):
+        grid_path = next(self._iter_grib_files(), None)
+        if grid_path is None:
+            raise RuntimeError(
+                f"No GFS GRIB files found under {self.path} with product={self.product!r}"
+            )
+
+        print(f"loading GFS GRIB forecast grid from {grid_path}")
+        pygrib = self._import_pygrib()
+        with pygrib.open(str(grid_path)) as ds:
+            messages = ds.read(1)
+            if len(messages) == 0:
+                raise ValueError(f"No GRIB messages found in {grid_path}")
+            lat, lon = messages[0].latlons()
+
+        return {"longitude": lon, "latitude": lat}
+
+    @staticmethod
+    def _normalize_date_query(date):
+        if isinstance(date, str) and re.fullmatch(r"\d{8}", date):
+            date = f"{date[:4]}-{date[4:6]}-{date[6:8]}"
+
+        dt = np.datetime64(date)
+        unit = np.datetime_data(dt.dtype)[0]
+        day = dt.astype("datetime64[D]")
+
+        if unit in {"Y", "M", "W", "D"}:
+            return day, None
+
+        return day, dt.astype("datetime64[h]")
+
+    @staticmethod
+    def _file_for_lead(run: ForecastRunRecord, lead_h: Optional[int]) -> Path:
+        if lead_h is None:
+            return run.files[0]
+
+        ids = np.where(run.lead_times_h == int(lead_h))[0]
+        if len(ids) == 0:
+            raise KeyError(
+                f"Run {run.init_time} has no lead_h={lead_h}. "
+                f"Available leads: {run.lead_times_h.tolist()}"
+            )
+
+        return run.files[int(ids[0])]
+
+    def _resolve_inventory_file(self, date=None, lead_h: Optional[int] = None) -> Path:
+        if not self.runs_dict:
+            raise RuntimeError("No GFS forecast runs were parsed.")
+
+        if date is None:
+            init_time = sorted(self.runs_dict.keys())[0]
+            return self._file_for_lead(self.runs_dict[init_time], lead_h)
+
+        query_day, query_time = self._normalize_date_query(date)
+
+        if query_time is not None and query_time in self.runs_dict:
+            return self._file_for_lead(self.runs_dict[query_time], lead_h)
+
+        matches = [
+            run
+            for init_time, run in sorted(self.runs_dict.items())
+            if init_time.astype("datetime64[D]") == query_day
+        ]
+        if not matches:
+            raise KeyError(f"No GFS forecast runs found for date={date!r}")
+
+        return self._file_for_lead(matches[0], lead_h)
+
+    @staticmethod
+    def _safe_grib_attr(message, attr: str, default=None):
+        try:
+            return getattr(message, attr)
+        except (AttributeError, RuntimeError, ValueError):
+            return default
+
+    @staticmethod
+    def _selector_for_inventory_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        selector = {}
+        for key in ("shortName", "typeOfLevel", "level"):
+            value = row.get(key)
+            if value is not None:
+                selector[key] = value
+        return selector
+
+    def list_data_variables(self, date=None, lead_h: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        List GRIB variables available in the first matching GFS file.
+
+        Parameters
+        ----------
+        date:
+            Optional init date or init time. Examples: "20260301",
+            "2026-03-01", "2026-03-01T00". If omitted, the first parsed run
+            is inspected.
+        lead_h:
+            Optional forecast lead hour to inspect. If omitted, the first
+            available lead in the selected run is inspected.
+
+        Returns
+        -------
+        list[dict]
+            Each row includes GRIB metadata and a "data_variable" entry that
+            can be passed to data_variables. Unique shortNames are returned as
+            strings; duplicate shortNames are returned as selector dicts.
+        """
+        file = self._resolve_inventory_file(date=date, lead_h=lead_h)
+        pygrib = self._import_pygrib()
+
+        rows = []
+        with pygrib.open(str(file)) as ds:
+            ds.seek(0)
+            for i, message in enumerate(ds, start=1):
+                row = {
+                    "message": i,
+                    "shortName": self._safe_grib_attr(message, "shortName"),
+                    "name": self._safe_grib_attr(message, "name"),
+                    "parameterName": self._safe_grib_attr(message, "parameterName"),
+                    "typeOfLevel": self._safe_grib_attr(message, "typeOfLevel"),
+                    "level": self._safe_grib_attr(message, "level"),
+                    "units": self._safe_grib_attr(message, "units"),
+                    "forecastTime": self._safe_grib_attr(message, "forecastTime"),
+                    "stepRange": self._safe_grib_attr(message, "stepRange"),
+                    "file": file,
+                }
+                rows.append(row)
+
+        short_name_counts = {}
+        for row in rows:
+            short_name = row["shortName"]
+            if short_name is not None:
+                short_name_counts[short_name] = short_name_counts.get(short_name, 0) + 1
+
+        for row in rows:
+            short_name = row["shortName"]
+            if short_name is not None and short_name_counts[short_name] == 1:
+                row["data_variable"] = short_name
+            else:
+                row["data_variable"] = self._selector_for_inventory_row(row)
+
+        return rows
+
+    def _read_lead_axis_h(self, files: List[Path]) -> np.ndarray:
+        if len(files) == 0:
+            raise ValueError("Empty files list passed to _read_lead_axis_h")
+
+        lead_h = np.array([self._parse_lead_h(file) for file in files], dtype=np.int32)
+
+        if np.any(lead_h < 0):
+            raise ValueError(f"Negative GFS lead times found in {files[0].parent}")
+
+        if self.expected_max_lead_h is not None and lead_h.max() > self.expected_max_lead_h:
+            msg = (
+                f"Run {self._parse_init_time(files[0])} has max lead {lead_h.max()}h, "
+                f"but expected_max_lead_h={self.expected_max_lead_h}"
+            )
+            if self.strict:
+                raise ValueError(msg)
+            warnings.warn(msg)
+
+        if self.expected_lead_step_h is not None and len(lead_h) > 1:
+            diffs = np.diff(lead_h)
+            bad = diffs != self.expected_lead_step_h
+            if np.any(bad):
+                msg = (
+                    f"Run {self._parse_init_time(files[0])} has irregular lead spacing "
+                    f"{np.unique(diffs)}, expected {self.expected_lead_step_h}h"
+                )
+                if self.strict:
+                    raise ValueError(msg)
+                warnings.warn(msg)
+
+        return lead_h
+
+    @staticmethod
+    def _variable_selectors(variable: Any) -> List[Dict[str, Any]]:
+        if isinstance(variable, dict):
+            return [variable]
+
+        if isinstance(variable, str):
+            return [
+                {"shortName": variable},
+                {"name": variable},
+                {"parameterName": variable},
+            ]
+
+        raise TypeError(
+            "GFS GRIB data_variables must contain strings or pygrib selector dicts"
+        )
+
+    @classmethod
+    def _select_grib_message(cls, ds, variable: Any, file: Path):
+        for selector in cls._variable_selectors(variable):
+            try:
+                messages = ds.select(**selector)
+            except (RuntimeError, ValueError):
+                continue
+
+            if len(messages) == 1:
+                return messages[0]
+
+            if len(messages) > 1:
+                raise ValueError(
+                    f"{file.name}: variable {variable!r} matched {len(messages)} "
+                    f"GRIB messages with selector {selector}. Use a dict selector "
+                    "with enough GRIB keys to make it unique."
+                )
+
+        raise KeyError(f"{file.name}: no GRIB message matched variable {variable!r}")
+
+    @staticmethod
+    def _grib_values(message) -> np.ndarray:
+        values = message.values
+        if np.ma.isMaskedArray(values):
+            values = values.filled(np.nan)
+        return np.asarray(values)
+
+    def _load_file_vars(self, file: Path, pygrib) -> np.ndarray:
+        with pygrib.open(str(file)) as ds:
+            if self.data_variables is None:
+                ds.seek(0)
+                messages = list(ds)
+            else:
+                messages = [
+                    self._select_grib_message(ds, variable, file)
+                    for variable in self.data_variables
+                ]
+
+            if len(messages) == 0:
+                raise ValueError(f"No GRIB messages found in {file}")
+
+            return np.stack([self._grib_values(message) for message in messages], axis=0)
+
+    def _load_run_slice(self, files: List[Path], lead_ids) -> np.ndarray:
+        if len(files) == 0:
+            raise ValueError("Empty files list passed to _load_run_slice")
+
+        lead_ids = np.asarray(list(lead_ids), dtype=int)
+        pygrib = self._import_pygrib()
+
+        npy = []
+        for lead_id in lead_ids:
+            npy.append(self._load_file_vars(files[int(lead_id)], pygrib))
+
+        npy = np.stack(npy, axis=0)
+        if self.transform:
+            npy = self.transform(npy)
+        return npy
+
 
 class ForecastWindowSample(NamedTuple):
     """
@@ -565,7 +953,14 @@ class ForecastWindowDataset(Dataset):
             )
 
         return np.array(anchor_times, dtype="datetime64[h]")
-    
+
+    @property
+    def grid(self):
+        # if self.dst_grid is not None:  # todo
+        #     return self.dst_grid
+        return self.src_grid
+
+
 class MetricField(np.ndarray):
     """
     ndarray with attached metadata.
