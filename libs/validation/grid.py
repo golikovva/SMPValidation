@@ -95,9 +95,11 @@ class Grid:
             np.array: 2D array of cell areas in square kilometers.
         """
         field = esmpy.Field(self.grid)  # Create an ESMF Field associated with the grid
-        field.get_area()  # Get the areas of the cells in radians^2
-        areas = field.data * self.earth_radius ** 2  # Convert to km^2 using Earth's radius
-        return areas
+        try:
+            field.get_area()  # Get the areas of the cells in radians^2
+            return field.data * self.earth_radius ** 2  # Independent array in km^2
+        finally:
+            field.destroy()
 
     def land_mask(self):
         """
