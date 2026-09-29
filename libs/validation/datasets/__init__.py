@@ -7,6 +7,7 @@ from libs.validation.datasets.amsr_jaxa import (
 from libs.validation.datasets.cryosat import (
     CryosatThickDataset,
 )
+from libs.validation.datasets.copernicus_sar import CopernicusSarSicDataset
 from libs.validation.datasets.glorys import (
     GlorysOperativeCorrectedSalinityDataset,
     GlorysOperativeCurrentVelocityDataset,
@@ -35,6 +36,7 @@ from libs.validation.datasets.nemo import (
     NemoTemperatureDataset,
     NemoThickDataset,
 )
+from libs.validation.datasets.ostia import OstiaSicDataset, OstiaSstDataset
 from libs.validation.datasets.shapefile import (
     ShapefileDriftDataset,
     ShapefileSicDataset,

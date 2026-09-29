@@ -83,19 +83,36 @@ def emulate_itp_track(
     if tvals.size < 1:
         raise ValueError("Empty time dimension.")
 
-    # Make a *naive* python datetime (avoid tz-aware vs naive mismatches later)
-    t0 = pd.to_datetime(tvals[0], unit="s", origin="1900-01-01").to_pydatetime()
+    units = ds[time_var].attrs.get("units", "seconds since 1900-01-01 00:00:00")
+    calendar = ds[time_var].attrs.get("calendar", "gregorian")
 
-    if tvals.size >= 2:
-        # safest: compute dt from numeric axis directly
-        dt_seconds = int(np.round(float(tvals[1] - tvals[0])))
-        if dt_seconds <= 0:
-            raise ValueError("Non-positive time step inferred from time axis.")
-    else:
-        dt_seconds = 3600
+    # Robust CF decode if possible
+    try:
+        dts = netCDF4.num2date(
+            tvals,
+            units=units,
+            calendar=calendar,
+            only_use_cftime_datetimes=False,
+        )
+        t0 = pd.Timestamp(dts[0]).to_pydatetime()
+        if len(dts) >= 2:
+            dt_seconds = int(round((pd.Timestamp(dts[1]) - pd.Timestamp(dts[0])).total_seconds()))
+        else:
+            dt_seconds = 3600
+    except Exception:
+        # fallback (your old behavior)
+        t0 = pd.to_datetime(tvals[0], unit="s", origin="1900-01-01").to_pydatetime()
+        if tvals.size >= 2:
+            dt_seconds = int(np.round(float(tvals[1] - tvals[0])))
+        else:
+            dt_seconds = 3600
+
+    if dt_seconds <= 0:
+        raise ValueError("Non-positive time step inferred from time axis.")
 
     T = int(tvals.size)
     duration_seconds = max(0, (T - 1) * dt_seconds)
+
 
     # --- normalize start_coords & detect order ---
     start_coords = np.asarray(start_coords, dtype=float)
@@ -125,25 +142,32 @@ def emulate_itp_track(
         {lat_var: "lat", lon_var: "lon", time_var: "time"}
     )
 
-    # Make sure u/v actually use the renamed time dim (xarray usually does, but enforce)
-    if "time" not in ds_min[u_var].dims:
-        # if rename didn't propagate, do it explicitly
-        ds_min[u_var] = ds_min[u_var].rename({ds_min[u_var].dims[0]: "time"})
-    if "time" not in ds_min[v_var].dims:
-        ds_min[v_var] = ds_min[v_var].rename({ds_min[v_var].dims[0]: "time"})
+    # Ensure these are coordinates (important for some xarray layouts)
+    ds_min = ds_min.set_coords(["lat", "lon", "time"])
 
-    # CF metadata that reader_netCDF_CF_generic relies on to detect time
+    # Keep the file's own CF time metadata (don’t hardcode 1900 for TOPAZ)
     ds_min["time"].attrs.update(
         {
             "standard_name": "time",
-            "units": "seconds since 1900-01-01 00:00:00",
-            "calendar": "gregorian",
+            "units": units,
+            "calendar": calendar,
         }
     )
-
-    # Lon/lat metadata (good practice; not the cause of your crash)
     ds_min["lon"].attrs.update({"standard_name": "longitude", "units": "degrees_east"})
     ds_min["lat"].attrs.update({"standard_name": "latitude", "units": "degrees_north"})
+    # If lon is 1D and global, shift/sort so the seam is far from seeded lons
+    if ds_min["lon"].ndim == 1:
+        lon_vals = np.asarray(ds_min["lon"].values, dtype=float)
+        span = float(np.nanmax(lon_vals) - np.nanmin(lon_vals))
+        if span > 300.0:  # global-ish coverage -> seam issues possible
+            lon_center = _circular_mean_deg(lons)  # lons are your seed lons (already normalized)
+            lon_shift = _shift_lon_like(lon_vals, lon_center)
+            order = np.argsort(lon_shift)
+
+            ds_min = ds_min.isel(lon=order).assign_coords(lon=lon_shift[order])
+
+            # shift the seed longitudes into the same coordinate system
+            lons = _shift_lon_like(lons, lon_center)
 
     standard_name_mapping = {
         u_var: "sea_ice_x_velocity",
@@ -180,7 +204,8 @@ def emulate_itp_track(
     res = o.result
     lon_hist = res["lon"].values
     lat_hist = res["lat"].values
-
+    lon_hist = ((lon_hist + 180.0) % 360.0) - 180.0
+    
     track = np.stack([lat_hist, lon_hist], axis=-1).transpose(1, 0, 2)
 
     # pad/trim to exactly T

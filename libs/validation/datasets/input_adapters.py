@@ -194,6 +194,10 @@ class BuoyInputAdapter:
     identical reference IDs, times, variable order, units and sampling positions.
     array_dims declares its axes explicitly (e.g. time,variable,buoy for the old
     interpolation wrapper). This opt-in cannot verify identities the array lost.
+    An interpolated field with buoy_sampling metadata carries its own geometry;
+    assume_aligned=True may fill missing model names/units from that reference
+    schema. It never overrides explicit model names/units. Such a field can also
+    be a unary metric's reference (reference_index=-1 works for unary and pairs).
 
     variable_maps maps input index -> {canonical_name: source_name}; target_units
     maps canonical_name -> output unit, defaulting to reference units. Unknown
@@ -224,8 +228,7 @@ class BuoyInputAdapter:
         self.result_dims = None if result_dims is None else tuple(result_dims)
         self.result_units = None if result_units is None else tuple(result_units)
 
-    @staticmethod
-    def _unpack(value):
+    def _unpack(self, value):
         if hasattr(value, "bids") and hasattr(value, "variables"):
             required = ("bids", "datetimes", "var_names", "units", "coords")
             for name in required:
@@ -237,7 +240,16 @@ class BuoyInputAdapter:
                     meta[name] = getattr(value, name)
             meta.update(dims=POINT_DIMS, provenance=getattr(value, "metadata", {}))
             return np.asarray(value.variables), meta
-        return np.asarray(value), dict(getattr(value, "meta", {}) or {})
+        meta = dict(getattr(value, "meta", {}) or {})
+        sampling = meta.get("buoy_sampling")
+        if sampling is not None and self.assume_aligned:
+            # The interpolator knows the sampling geometry, but reference
+            # channel names/units describe the model only by explicit opt-in.
+            # Actual model labels always take precedence over these defaults.
+            for name in ("var_names", "units"):
+                if name not in meta and name in sampling:
+                    meta[name] = sampling[name]
+        return np.asarray(value), meta
 
     @staticmethod
     def _field(values, meta):
@@ -282,6 +294,14 @@ class BuoyInputAdapter:
             raise ValueError("reference_index must identify an input observation batch.")
         reference_index = self.reference_index % len(inputs)
         raw_reference, reference_meta = self._unpack(inputs[reference_index])
+        missing = {"dims", "bids", "datetimes", "var_names", "units"} - reference_meta.keys()
+        if missing:
+            raise ValueError(
+                f"Reference input {reference_index} is missing point metadata {sorted(missing)}. "
+                "For unary metrics the input must describe its own sampling points; "
+                "use an annotated InterpolatedOverBuoysDataset result or provide point metadata. "
+                "assume_aligned=True cannot recover IDs or times from a bare reference array."
+            )
         reference = self._field(raw_reference, reference_meta)
         _, ref_bids, ref_times, ref_names, ref_units, _, ref_coords, ref_coord_valid = reference
         if ref_coords is None:
